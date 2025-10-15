@@ -1,0 +1,782 @@
+/* global acquireVsCodeApi */
+const vscode = acquireVsCodeApi();
+
+const LANGUAGES = [
+	{ id: 'python', label: 'Python (语言代码 6)' },
+	{ id: 'cpp', label: 'C++ (语言代码 1)' },
+	{ id: 'java', label: 'Java (语言代码 3)' },
+];
+
+const METADATA_LABEL_ALIASES = {
+	'来源/分类': '来源/分类',
+	'source/category': '来源/分类',
+	'source': '来源/分类',
+	'memory limit': '内存限制',
+	'time limit': '时间限制',
+	'judge style': '评测方式',
+	'creator': '命题人',
+	'submit': '提交数',
+	'solved': '通过数',
+};
+
+const state = {
+	loggedIn: false,
+	problemset: [],
+	currentProblemId: null,
+	pendingRestore: false,
+	problemsetRequest: null,
+	submission: {
+		initial: null,
+		final: null,
+		loading: false,
+		error: null,
+	},
+};
+
+let selectedProblemRow = null;
+
+const loginPanel = document.getElementById('login-panel');
+const loginSummary = document.getElementById('login-summary');
+const loginForm = document.getElementById('login-form');
+const loginStatus = document.getElementById('login-status');
+const problemsetForm = document.getElementById('problemset-form');
+const problemsetTable = document.getElementById('problemset-table');
+const problemsetBody = problemsetTable.querySelector('tbody');
+const problemOutput = document.getElementById('problem-output');
+const problemActions = document.getElementById('problem-actions');
+const fileStatus = document.getElementById('file-status');
+const detailFileForm = document.getElementById('detail-file-form');
+const detailSubmitForm = document.getElementById('detail-submit-form');
+const languageSelect = document.getElementById('language-select');
+const submitFileInput = detailSubmitForm.querySelector('input[name="filePath"]');
+const submissionOutput = document.getElementById('submission-output');
+const statusForm = document.getElementById('status-form');
+const statusTable = document.getElementById('status-table');
+const statusBody = statusTable.querySelector('tbody');
+
+function canonicalMetadataLabel(label) {
+	const key = String(label ?? '').toLowerCase().trim();
+	if (!key) {
+		return '';
+	}
+	return METADATA_LABEL_ALIASES[key] ?? label.trim();
+}
+
+function normalizeValueList(raw) {
+	if (raw === undefined || raw === null) {
+		return [];
+	}
+	const values = Array.isArray(raw) ? raw : String(raw).split(/\r?\n+/u);
+	const cleaned = values
+		.map((item) => String(item).trim())
+		.filter((item) => Boolean(item));
+	const unique = Array.from(new Set(cleaned));
+	return unique;
+}
+
+function collectMetadataEntries(problem) {
+	const entries = [];
+	const seenSignatures = new Set();
+	const maybeAdd = (label, rawValue) => {
+		const canonicalLabel = canonicalMetadataLabel(label);
+		if (!canonicalLabel) {
+			return;
+		}
+		const list = normalizeValueList(rawValue);
+		if (list.length === 0) {
+			return;
+		}
+		const signature = `${canonicalLabel}::${list.map((item) => item.toLowerCase()).join('|')}`;
+		if (seenSignatures.has(signature)) {
+			return;
+		}
+		seenSignatures.add(signature);
+		entries.push({
+			label: canonicalLabel,
+			value: list.join(' / '),
+		});
+	};
+
+	if (problem.source) {
+		maybeAdd('来源/分类', problem.source);
+	}
+
+	for (const [label, value] of Object.entries(problem.metadata ?? {})) {
+		maybeAdd(label, value);
+	}
+
+	return entries;
+}
+
+function updateLoginSummary(text) {
+	if (!loginSummary) {
+		return;
+	}
+	loginSummary.textContent = text;
+}
+
+function collapseLoginPanel(userId, restored = false) {
+	if (!loginPanel) {
+		return;
+	}
+	const prefix = restored ? '已恢复登录' : '已登录';
+	const safeUserId = userId ? String(userId) : '未知用户';
+	updateLoginSummary(`${prefix}：${safeUserId}（点击展开以重新登录）`);
+	loginPanel.open = false;
+}
+
+function expandLoginPanel() {
+	if (!loginPanel) {
+		return;
+	}
+	updateLoginSummary('登录账号（点击展开）');
+	if (!loginPanel.open) {
+		loginPanel.open = true;
+	}
+}
+
+function populateLanguages() {
+	for (const option of LANGUAGES) {
+		const one = document.createElement('option');
+		one.value = option.id;
+		one.textContent = option.label;
+		languageSelect.appendChild(one);
+	}
+	languageSelect.value = LANGUAGES[0].id;
+}
+
+function setStatus(target, message, isError = false) {
+	target.textContent = message;
+	if (isError) {
+		target.classList.add('error');
+	} else {
+		target.classList.remove('error');
+	}
+}
+
+function restoreProblemsetForm(request) {
+	if (!request) {
+		return;
+	}
+	const startInput = problemsetForm.querySelector('input[name="startPage"]');
+	const maxInput = problemsetForm.querySelector('input[name="maxPages"]');
+	if (startInput) {
+		const rawStart = Number(request.startPage);
+		const normalizedStart = Number.isFinite(rawStart) && rawStart > 0 ? rawStart : 1;
+		startInput.value = String(normalizedStart);
+	}
+	if (maxInput) {
+		const rawMax = Number(request.maxPages);
+		if (!Number.isFinite(rawMax) || rawMax <= 1) {
+			maxInput.value = '';
+		} else {
+			const normalizedMax = Math.max(1, rawMax);
+			maxInput.value = String(normalizedMax);
+		}
+	}
+}
+
+function flattenProblemset(problemset) {
+	const rows = [];
+	for (const [page, problems] of Object.entries(problemset)) {
+		for (const problem of problems) {
+			rows.push({ ...problem, page });
+		}
+	}
+	return rows.sort((a, b) => String(a.problem_id).localeCompare(String(b.problem_id), 'zh-Hans-CN', { numeric: true }));
+}
+
+function highlightProblemRow(problemId) {
+	const selector = `tr[data-problem-id="${problemId}"]`;
+	const row = problemsetBody.querySelector(selector);
+	if (!row) {
+		return false;
+	}
+	if (selectedProblemRow && selectedProblemRow !== row) {
+		selectedProblemRow.classList.remove('active');
+	}
+	selectedProblemRow = row;
+	row.classList.add('active');
+	problemActions.classList.remove('hidden');
+	return true;
+}
+
+function clearCurrentProblem({ notifyExtension = true } = {}) {
+	if (selectedProblemRow) {
+		selectedProblemRow.classList.remove('active');
+		selectedProblemRow = null;
+	}
+	if (notifyExtension && state.currentProblemId !== null) {
+		vscode.postMessage({ type: 'selectProblem', payload: { problemId: null } });
+	}
+	state.currentProblemId = null;
+	state.pendingRestore = false;
+	problemActions.classList.add('hidden');
+	problemOutput.innerHTML = '<div class="placeholder">请选择题目以查看详情</div>';
+	setStatus(fileStatus, '');
+	resetSubmissionState();
+}
+
+function normalizeContent(value) {
+	return String(value ?? '')
+		.replace(/<[^>]*>/g, ' ')
+		.replace(/\s+/g, ' ')
+		.trim()
+		.toLowerCase();
+}
+
+const SUBMISSION_INITIAL_FIELDS = [
+	{ key: 'solution_id', label: '提交编号' },
+	{ key: 'result_text', label: '当前状态' },
+	{ key: 'user', label: '用户名' },
+	{ key: 'nickname', label: '昵称' },
+	{ key: 'problem_id', label: '题目编号' },
+	{ key: 'language', label: '语言' },
+	{ key: 'code_length', label: '代码长度' },
+	{ key: 'submitted_at', label: '提交时间' },
+];
+
+const SUBMISSION_FINAL_FIELDS = [
+	{ key: 'solution_id', label: '提交编号' },
+	{ key: 'result_text', label: '最终结果' },
+	{ key: 'result_code', label: '结果代码' },
+	{ key: 'memory', label: '内存' },
+	{ key: 'time', label: '耗时' },
+	{ key: 'ac_rate', label: '通过率' },
+];
+
+const SUBMISSION_COMBINED_FIELDS = [
+	{ key: 'solution_id', label: '提交编号' },
+	{ key: 'result_text', label: '结果状态' },
+	{ key: 'result_code', label: '结果代码' },
+	{ key: 'user', label: '用户名' },
+	{ key: 'nickname', label: '昵称' },
+	{ key: 'problem_id', label: '题目编号' },
+	{ key: 'language', label: '语言' },
+	{ key: 'code_length', label: '代码长度' },
+	{ key: 'submitted_at', label: '提交时间' },
+	{ key: 'memory', label: '内存' },
+	{ key: 'time', label: '耗时' },
+	{ key: 'ac_rate', label: '通过率' },
+];
+
+function resetSubmissionState() {
+	state.submission = {
+		initial: null,
+		final: null,
+		loading: false,
+		error: null,
+	};
+	renderSubmissionPlaceholder();
+}
+
+function renderSubmissionPlaceholder() {
+	submissionOutput.innerHTML = '<div class="placeholder">执行提交后将在此处展示结果</div>';
+}
+
+function renderSubmissionLoading() {
+	submissionOutput.innerHTML = '<div class="placeholder">提交中，请稍候…</div>';
+}
+
+function renderSubmissionError(message) {
+	submissionOutput.innerHTML = `<div class="placeholder error">${escapeHtml(message)}</div>`;
+}
+
+function formatKeyValueList(data, fields) {
+	if (!data) {
+		return '';
+	}
+	const items = fields
+		.map((field) => {
+			const value = data[field.key];
+			if (value === undefined || value === null || value === '') {
+				return '';
+			}
+			return `
+				<div class="kv-item">
+					<span class="kv-label">${escapeHtml(field.label)}</span>
+					<span class="kv-value">${escapeHtml(String(value))}</span>
+				</div>
+			`;
+		})
+		.filter(Boolean)
+		.join('');
+	return items;
+}
+
+function getResultPill(resultText, resultCode) {
+	const code = Number(resultCode);
+	let tone = 'neutral';
+	if (Number.isFinite(code)) {
+		if (code === 4) {
+			tone = 'success';
+		} else if (code > 4) {
+			tone = 'danger';
+		}
+	}
+	const text = resultText ? escapeHtml(String(resultText)) : '未知状态';
+	return `<span class="result-pill ${tone}">${text}</span>`;
+}
+
+function renderSubmissionState() {
+	const { initial, final, loading, error } = state.submission;
+	if (error) {
+		renderSubmissionError(error);
+		return;
+	}
+	if (!initial && !final && !loading) {
+		renderSubmissionPlaceholder();
+		return;
+	}
+	if (loading && !initial) {
+		renderSubmissionLoading();
+		return;
+	}
+	const sections = [];
+	if (final) {
+		const combined = { ...(initial ?? {}), ...final };
+		const list = formatKeyValueList(combined, SUBMISSION_COMBINED_FIELDS);
+		const badge = getResultPill(final.result_text ?? combined.result_text ?? '未知', final.result_code ?? combined.result_code);
+		sections.push(`
+			<section class="submission-section">
+				<header>
+					<h3>提交结果</h3>
+					${badge}
+				</header>
+				<div class="kv-list">${list}</div>
+			</section>
+		`);
+	} else if (initial) {
+		const list = formatKeyValueList(initial, SUBMISSION_INITIAL_FIELDS);
+		const badge = getResultPill(initial.result_text ?? '排队中', initial.result_code);
+		sections.push(`
+			<section class="submission-section">
+				<header>
+					<h3>提交响应</h3>
+					${badge}
+				</header>
+				<div class="kv-list">${list}</div>
+			</section>
+		`);
+	}
+	if (!final && loading) {
+		sections.push(`
+			<section class="submission-section">
+				<header>
+					<h3>最终判题</h3>
+					<span class="result-pill neutral">等待评测结果…</span>
+				</header>
+				<div class="kv-list">
+					<div class="kv-item">
+						<span class="kv-label">提示</span>
+						<span class="kv-value">系统正在获取最终结果</span>
+					</div>
+				</div>
+			</section>
+		`);
+	}
+	if (sections.length === 0) {
+		renderSubmissionPlaceholder();
+		return;
+	}
+	submissionOutput.innerHTML = `<div class="submission-panels">${sections.join('')}</div>`;
+}
+
+	function renderProblemset(data) {
+		state.problemset = flattenProblemset(data);
+		problemsetBody.innerHTML = '';
+		const previousId = state.currentProblemId;
+		let matchedRow = null;
+		if (state.problemset.length === 0) {
+			clearCurrentProblem({ notifyExtension: previousId !== null });
+			const row = document.createElement('tr');
+			row.innerHTML = '<td colspan="4" class="placeholder">未获取到题目数据</td>';
+			problemsetBody.appendChild(row);
+			return;
+		}
+		for (const problem of state.problemset) {
+			const row = document.createElement('tr');
+			row.dataset.problemId = String(problem.problem_id);
+			if (problem.is_accepted === true) {
+				row.classList.add('accepted');
+			} else if (problem.is_accepted === false) {
+				row.classList.add('pending');
+			}
+			const solved = problem.solved ?? '-';
+			const submitted = problem.submitted ?? '-';
+			const acceptanceValue = problem.acceptance ?? problem.accept;
+			const numericAcceptance = Number.parseFloat(acceptanceValue);
+			const acceptance = Number.isFinite(numericAcceptance)
+				? `${numericAcceptance.toFixed(2)}%`
+				: '-';
+			const problemIdNumber = Number(problem.problem_id);
+			let statusChip = '<span class="status-chip neutral">未评测</span>';
+			if (problem.is_accepted === true) {
+				statusChip = '<span class="status-chip success">已通过</span>';
+			} else if (problem.is_accepted === false) {
+				statusChip = '<span class="status-chip danger">未通过</span>';
+			}
+			row.innerHTML = `
+				<td>${problem.problem_id}</td>
+				<td>
+					<div class="title">${problem.title}</div>
+					<div class="meta">第 ${problem.page} 页 · ${statusChip}</div>
+				</td>
+				<td>${solved} / ${submitted}</td>
+				<td>${acceptance}</td>
+			`;
+			problemsetBody.appendChild(row);
+			if (Number.isFinite(problemIdNumber) && problemIdNumber === previousId) {
+				matchedRow = row;
+			}
+		}
+
+		if (matchedRow) {
+			state.currentProblemId = previousId;
+			highlightProblemRow(previousId);
+			if (state.pendingRestore && state.currentProblemId !== null) {
+				const restoreId = state.currentProblemId;
+				state.pendingRestore = false;
+				problemOutput.innerHTML = '<div class="placeholder">题目详情加载中…</div>';
+				vscode.postMessage({
+					type: 'fetchProblem',
+					payload: { problemId: restoreId },
+				});
+			}
+		} else {
+			const shouldNotify = previousId !== null;
+			clearCurrentProblem({ notifyExtension: shouldNotify });
+		}
+	}
+
+	function escapeHtml(value) {
+		return String(value ?? '')
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;')
+			.replace(/'/g, '&#39;');
+	}
+
+	function formatParagraph(value) {
+		if (!value) {
+			return '';
+		}
+		const escaped = escapeHtml(String(value)).replace(/\n/g, '<br />');
+		return `<p>${escaped}</p>`;
+	}
+
+	function renderProblemDetail(problem) {
+		const numericId = Number(problem.problem_id);
+		if (Number.isFinite(numericId) && !Number.isNaN(numericId)) {
+			state.currentProblemId = numericId;
+		}
+		const sections = [];
+		const seenContent = new Set();
+		const pushSection = (title, rawValue, formatter = formatParagraph) => {
+			if (rawValue === undefined || rawValue === null) {
+				return;
+			}
+			const signature = normalizeContent(rawValue);
+			if (!signature || seenContent.has(signature)) {
+				return;
+			}
+			seenContent.add(signature);
+			sections.push({ title, content: formatter(String(rawValue)) });
+		};
+
+		pushSection('题目描述', problem.description);
+		pushSection('输入说明', problem.input);
+		pushSection('输出说明', problem.output);
+		pushSection('样例输入', problem.sample_input, (value) => `<pre>${escapeHtml(value)}</pre>`);
+		pushSection('样例输出', problem.sample_output, (value) => `<pre>${escapeHtml(value)}</pre>`);
+		pushSection('提示', problem.hint);
+
+		const metadataEntries = collectMetadataEntries(problem);
+		const metadataLabels = new Set(metadataEntries.map((entry) => normalizeContent(entry.label)));
+		const metadataValues = new Set(metadataEntries.map((entry) => normalizeContent(entry.value)));
+
+		if (problem.raw_sections) {
+			const skipTitles = new Set(['description', 'input', 'output', 'sample input', 'sample output', 'hint', 'source/category']);
+			for (const [title, value] of Object.entries(problem.raw_sections)) {
+				const normalizedTitle = normalizeContent(title);
+				if (skipTitles.has(normalizedTitle)) {
+					continue;
+				}
+				if (metadataLabels.has(normalizedTitle) || metadataValues.has(normalizedTitle)) {
+					continue;
+				}
+				pushSection(title, value, (content) => formatParagraph(content));
+			}
+		}
+
+		const tags = Array.isArray(problem.tags) ? problem.tags : [];
+		const problemTitle = problem.raw_title || `${problem.problem_id ?? ''} ${problem.title ?? ''}`;
+		const problemUrl = problem.url ? `<a href="${escapeHtml(problem.url)}" target="_blank">查看原题</a>` : '<span>无原题链接</span>';
+
+		const headerHtml = `
+			<div class="problem-header">
+				<h3>${escapeHtml(problemTitle)}</h3>
+				<div class="problem-meta">
+					<span>编号：${escapeHtml(String(problem.problem_id))}</span>
+					<span>来源：${problemUrl}</span>
+				</div>
+			</div>
+		`;
+
+		const metaHtml = metadataEntries.length
+			? `<div class="meta-grid">${metadataEntries
+					.map(({ label, value }) => `
+						<div class="meta-item">
+							<span class="meta-label">${escapeHtml(label)}</span>
+							<span class="meta-value">${escapeHtml(value)}</span>
+						</div>`)
+					.join('')}</div>`
+			: '';
+
+		const sectionsHtml = sections.length
+			? `<div class="problem-sections">${sections
+					.map((section) => `
+						<section>
+							<h3>${escapeHtml(section.title)}</h3>
+							<div>${section.content}</div>
+						</section>
+					`)
+					.join('')}</div>`
+			: '';
+
+		const tagsHtml = tags.length
+			? `<div class="tag-list">${tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join('')}</div>`
+			: '';
+
+		problemOutput.innerHTML = `${headerHtml}${metaHtml}${sectionsHtml}${tagsHtml}`;
+		if (state.currentProblemId !== null) {
+			highlightProblemRow(state.currentProblemId);
+		}
+		problemActions.classList.toggle('hidden', state.currentProblemId === null);
+		setStatus(fileStatus, '');
+		renderSubmissionState();
+		state.pendingRestore = false;
+	}
+
+	function renderStatusTable(entries) {
+		statusBody.innerHTML = '';
+		if (!Array.isArray(entries) || entries.length === 0) {
+			const row = document.createElement('tr');
+			row.innerHTML = '<td colspan="7" class="placeholder">未获取到提交记录</td>';
+			statusBody.appendChild(row);
+			return;
+		}
+		for (const entry of entries) {
+			const row = document.createElement('tr');
+			row.innerHTML = `
+				<td>${entry.solution_id ?? '-'}</td>
+				<td>${escapeHtml(entry.problem_id ?? '-')}</td>
+				<td>${escapeHtml(entry.result_text ?? '-')}</td>
+				<td>${escapeHtml(entry.time ?? '-')}</td>
+				<td>${escapeHtml(entry.memory ?? '-')}</td>
+				<td>${escapeHtml(entry.language ?? '-')}</td>
+				<td>${escapeHtml(entry.submitted_at ?? '-')}</td>
+			`;
+			statusBody.appendChild(row);
+		}
+	}
+
+	loginForm.addEventListener('submit', (event) => {
+		event.preventDefault();
+		const formData = new FormData(loginForm);
+		const username = formData.get('username');
+		const password = formData.get('password');
+		setStatus(loginStatus, '登录中…');
+		if (loginPanel) {
+			loginPanel.open = true;
+		}
+		updateLoginSummary('登录中…');
+		vscode.postMessage({
+			type: 'login',
+			payload: { username, password },
+		});
+	});
+
+	problemsetForm.addEventListener('submit', (event) => {
+		event.preventDefault();
+		const formData = new FormData(problemsetForm);
+		const startPage = Number(formData.get('startPage') || 1);
+		const maxPagesRaw = formData.get('maxPages');
+		const maxPages = maxPagesRaw ? Math.max(1, Number(maxPagesRaw)) : 1;
+		state.problemsetRequest = { startPage, maxPages };
+		const row = document.createElement('tr');
+		row.innerHTML = '<td colspan="4" class="placeholder">题单加载中…</td>';
+		problemsetBody.innerHTML = '';
+		problemsetBody.appendChild(row);
+		state.pendingRestore = false;
+		vscode.postMessage({
+			type: 'fetchProblemset',
+			payload: { startPage, maxPages },
+		});
+	});
+
+	problemsetBody.addEventListener('click', (event) => {
+		const row = event.target.closest('tr');
+		if (!row || !row.dataset.problemId) {
+			return;
+		}
+		const problemId = Number(row.dataset.problemId);
+		if (!Number.isFinite(problemId)) {
+			return;
+		}
+		state.pendingRestore = false;
+		state.currentProblemId = problemId;
+		resetSubmissionState();
+		highlightProblemRow(problemId);
+		setStatus(fileStatus, '');
+		problemOutput.innerHTML = '<div class="placeholder">题目详情加载中…</div>';
+		vscode.postMessage({
+			type: 'selectProblem',
+			payload: { problemId },
+		});
+		vscode.postMessage({
+			type: 'fetchProblem',
+			payload: { problemId },
+		});
+	});
+
+	detailFileForm.addEventListener('submit', (event) => {
+		event.preventDefault();
+		if (!state.currentProblemId) {
+			setStatus(fileStatus, '请先选择题目', true);
+			return;
+		}
+		const formData = new FormData(detailFileForm);
+		const language = String(formData.get('language'));
+		setStatus(fileStatus, '处理中…');
+		vscode.postMessage({
+			type: 'createFile',
+			payload: { problemId: state.currentProblemId, language },
+		});
+	});
+
+	detailSubmitForm.addEventListener('submit', (event) => {
+		event.preventDefault();
+		if (!state.currentProblemId) {
+			renderSubmissionError('请先选择题目再进行提交');
+			return;
+		}
+		const formData = new FormData(detailSubmitForm);
+		const language = String(languageSelect.value);
+		const filePath = String(formData.get('filePath'));
+		state.submission = {
+			initial: null,
+			final: null,
+			loading: true,
+			error: null,
+		};
+		renderSubmissionLoading();
+		vscode.postMessage({
+			type: 'submitSolution',
+			payload: { problemId: state.currentProblemId, language, filePath },
+		});
+	});
+
+	statusForm.addEventListener('submit', (event) => {
+		event.preventDefault();
+		const formData = new FormData(statusForm);
+		const limit = Number(formData.get('limit') || 10);
+		const row = document.createElement('tr');
+		row.innerHTML = '<td colspan="7" class="placeholder">提交记录加载中…</td>';
+		statusBody.innerHTML = '';
+		statusBody.appendChild(row);
+		vscode.postMessage({
+			type: 'fetchStatus',
+			payload: { limit },
+		});
+	});
+
+	window.addEventListener('message', (event) => {
+		const message = event.data;
+		switch (message.type) {
+			case 'loginSuccess':
+				state.loggedIn = true;
+				state.pendingRestore = false;
+				setStatus(loginStatus, `已登录为 ${message.userId}`);
+				collapseLoginPanel(message.userId, false);
+				clearCurrentProblem({ notifyExtension: false });
+				break;
+			case 'sessionRestored':
+				state.loggedIn = true;
+				const numericId = Number(message.currentProblemId);
+				state.currentProblemId = Number.isFinite(numericId) ? numericId : null;
+				const problemsetState = message.problemset ?? null;
+				const cachedProblem = message.lastProblem ?? null;
+				const cachedProblemValid = Boolean(
+					cachedProblem &&
+					Number(cachedProblem.problemId) === state.currentProblemId &&
+					cachedProblem.data !== undefined &&
+					cachedProblem.data !== null,
+				);
+				state.pendingRestore = state.currentProblemId !== null && !cachedProblemValid;
+				if (problemsetState && problemsetState.request) {
+					state.problemsetRequest = problemsetState.request;
+					restoreProblemsetForm(problemsetState.request);
+				}
+				setStatus(loginStatus, `已恢复登录：${message.userId}`);
+				collapseLoginPanel(message.userId, true);
+				if (problemsetState && problemsetState.data) {
+					renderProblemset(problemsetState.data);
+				} else if (state.currentProblemId === null) {
+					clearCurrentProblem({ notifyExtension: false });
+				}
+				if (cachedProblemValid) {
+					renderProblemDetail(cachedProblem.data);
+				} else if (state.currentProblemId !== null && !(problemsetState && problemsetState.data)) {
+					highlightProblemRow(state.currentProblemId);
+				}
+				break;
+			case 'problemset':
+				renderProblemset(message.payload);
+				break;
+			case 'problem':
+				renderProblemDetail(message.payload);
+				break;
+			case 'status':
+				renderStatusTable(message.payload);
+				break;
+			case 'fileCreated':
+				setStatus(fileStatus, `文件已打开：${message.path}`);
+				submitFileInput.value = message.path;
+				break;
+			case 'submission':
+				state.submission.initial = message.payload ?? null;
+				state.submission.loading = true;
+				state.submission.error = null;
+				renderSubmissionState();
+				break;
+			case 'submissionStatus':
+				state.submission.final = message.payload ?? null;
+				if (state.submission.final && state.submission.initial && !state.submission.final.solution_id) {
+					state.submission.final.solution_id = state.submission.initial.solution_id ?? state.submission.initial.solution_id_text;
+				}
+				state.submission.loading = false;
+				state.submission.error = null;
+				renderSubmissionState();
+				break;
+			case 'error':
+				if (message.context === 'login') {
+					setStatus(loginStatus, message.message, true);
+					expandLoginPanel();
+				} else if (message.context === 'createFile') {
+					setStatus(fileStatus, message.message, true);
+				} else {
+					state.submission.loading = false;
+					state.submission.error = message.message;
+					renderSubmissionState();
+				}
+				break;
+			default:
+				console.warn('未知消息', message);
+		}
+	});
+
+	populateLanguages();
+	expandLoginPanel();
+	resetSubmissionState();
