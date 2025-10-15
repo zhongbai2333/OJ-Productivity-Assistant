@@ -25,6 +25,11 @@ const state = {
 	currentProblemId: null,
 	pendingRestore: false,
 	problemsetRequest: null,
+	rememberPassword: true,
+	samples: {
+		input: '',
+		output: '',
+	},
 	submission: {
 		initial: null,
 		final: null,
@@ -39,6 +44,7 @@ const loginPanel = document.getElementById('login-panel');
 const loginSummary = document.getElementById('login-summary');
 const loginForm = document.getElementById('login-form');
 const loginStatus = document.getElementById('login-status');
+const rememberCheckbox = loginForm.querySelector('input[name="remember"]');
 const problemsetForm = document.getElementById('problemset-form');
 const problemsetTable = document.getElementById('problemset-table');
 const problemsetBody = problemsetTable.querySelector('tbody');
@@ -53,6 +59,62 @@ const submissionOutput = document.getElementById('submission-output');
 const statusForm = document.getElementById('status-form');
 const statusTable = document.getElementById('status-table');
 const statusBody = statusTable.querySelector('tbody');
+const sampleTestButton = document.getElementById('sample-test-button');
+const sampleTestStatus = document.getElementById('sample-test-status');
+const sampleTestOutput = document.getElementById('sample-test-output');
+
+function renderStatusChip(accepted) {
+	if (accepted === true) {
+		return '<span class="status-chip success">已通过</span>';
+	}
+	if (accepted === false) {
+		return '<span class="status-chip danger">未通过</span>';
+	}
+	return '<span class="status-chip neutral">未评测</span>';
+}
+
+function updateProblemCompletion(problemId, accepted) {
+	const numericId = Number(problemId);
+	if (!Number.isFinite(numericId)) {
+		return;
+	}
+	const itemIndex = state.problemset.findIndex((entry) => Number(entry.problem_id) === numericId);
+	if (itemIndex === -1) {
+		return;
+	}
+	const item = state.problemset[itemIndex];
+	item.is_accepted = accepted ? true : item.is_accepted;
+	const row = problemsetBody.querySelector(`tr[data-problem-id="${item.problem_id}"]`);
+	if (!row) {
+		return;
+	}
+	row.classList.remove('accepted', 'pending');
+	if (item.is_accepted === true) {
+		row.classList.add('accepted');
+	} else if (item.is_accepted === false) {
+		row.classList.add('pending');
+	}
+	const meta = row.querySelector('.meta');
+	if (meta) {
+		const pageLabel = item.page ?? '-';
+		meta.innerHTML = `第 ${pageLabel} 页 · ${renderStatusChip(item.is_accepted === true ? true : item.is_accepted === false ? false : undefined)}`;
+	}
+	const chip = row.querySelector('.status-chip');
+	if (chip) {
+		chip.classList.remove('success', 'danger', 'neutral');
+		if (item.is_accepted === true) {
+			chip.classList.add('success');
+			chip.textContent = '已通过';
+		} else if (item.is_accepted === false) {
+			chip.classList.add('danger');
+			chip.textContent = '未通过';
+		} else {
+			chip.classList.add('neutral');
+			chip.textContent = '未评测';
+		}
+	}
+	highlightProblemRow(numericId);
+}
 
 function canonicalMetadataLabel(label) {
 	const key = String(label ?? '').toLowerCase().trim();
@@ -154,6 +216,97 @@ function setStatus(target, message, isError = false) {
 	}
 }
 
+function resetSampleTestUI() {
+	if (sampleTestStatus) {
+		setStatus(sampleTestStatus, '');
+	}
+	if (sampleTestOutput) {
+		sampleTestOutput.textContent = '';
+		sampleTestOutput.classList.add('hidden');
+	}
+}
+
+function updateSampleTestAvailability() {
+	const hasSample = Boolean(state.samples.input && state.samples.input.trim());
+	if (sampleTestButton) {
+		sampleTestButton.disabled = !hasSample;
+	}
+	if (problemOutput) {
+		problemOutput.querySelectorAll('.sample-run-btn').forEach((btn) => {
+			btn.disabled = !hasSample;
+		});
+	}
+}
+
+function triggerSampleTest() {
+	if (!sampleTestStatus || !sampleTestOutput) {
+		return;
+	}
+	if (!state.currentProblemId) {
+		setStatus(sampleTestStatus, '请先选择题目后再运行样例', true);
+		return;
+	}
+	const hasSample = Boolean(state.samples.input && state.samples.input.trim());
+	if (!hasSample) {
+		setStatus(sampleTestStatus, '当前题目没有提供样例输入', true);
+		return;
+	}
+	const filePath = submitFileInput.value.trim();
+	if (!filePath) {
+		setStatus(sampleTestStatus, '请先填写代码文件路径', true);
+		return;
+	}
+	setStatus(sampleTestStatus, '使用样例执行中…');
+	if (sampleTestOutput) {
+		sampleTestOutput.textContent = '';
+		sampleTestOutput.classList.add('hidden');
+	}
+	vscode.postMessage({
+		type: 'runSampleTest',
+		payload: {
+			problemId: state.currentProblemId,
+			language: String(languageSelect.value),
+			filePath,
+			sampleInput: state.samples.input,
+			expectedOutput: state.samples.output || null,
+		},
+	});
+}
+
+function renderSampleTestResult(payload) {
+	if (!sampleTestStatus || !sampleTestOutput) {
+		return;
+	}
+	if (!payload.ok) {
+		setStatus(sampleTestStatus, payload.error ?? '执行失败', true);
+		sampleTestOutput.textContent = '';
+		sampleTestOutput.classList.add('hidden');
+		return;
+	}
+	const exitLabel = payload.exitCode === undefined || payload.exitCode === null ? '未知' : String(payload.exitCode);
+	const matched = payload.matched;
+	if (matched === false) {
+		setStatus(sampleTestStatus, `执行完成：输出与样例不一致（退出码 ${exitLabel}）`, true);
+	} else if (matched === true) {
+		setStatus(sampleTestStatus, `执行完成：输出与样例一致（退出码 ${exitLabel}）`);
+	} else {
+		setStatus(sampleTestStatus, `执行完成（退出码 ${exitLabel}）`);
+	}
+	const parts = [];
+	const stdout = payload.stdout ?? '';
+	const stderr = payload.stderr ?? '';
+	const expected = payload.expectedOutput ?? '';
+	parts.push(`【标准输出】\n${stdout || '(空)'}`);
+	if (stderr) {
+		parts.push(`【标准错误】\n${stderr}`);
+	}
+	if (payload.expectedOutput !== null) {
+		parts.push(`【样例输出】\n${expected || '(空)'}`);
+	}
+	sampleTestOutput.textContent = parts.join('\n\n');
+	sampleTestOutput.classList.remove('hidden');
+}
+
 function restoreProblemsetForm(request) {
 	if (!request) {
 		return;
@@ -211,10 +364,13 @@ function clearCurrentProblem({ notifyExtension = true } = {}) {
 	}
 	state.currentProblemId = null;
 	state.pendingRestore = false;
+	state.samples = { input: '', output: '' };
 	problemActions.classList.add('hidden');
 	problemOutput.innerHTML = '<div class="placeholder">请选择题目以查看详情</div>';
 	setStatus(fileStatus, '');
 	resetSubmissionState();
+	resetSampleTestUI();
+	updateSampleTestAvailability();
 }
 
 function normalizeContent(value) {
@@ -410,17 +566,11 @@ function renderSubmissionState() {
 				? `${numericAcceptance.toFixed(2)}%`
 				: '-';
 			const problemIdNumber = Number(problem.problem_id);
-			let statusChip = '<span class="status-chip neutral">未评测</span>';
-			if (problem.is_accepted === true) {
-				statusChip = '<span class="status-chip success">已通过</span>';
-			} else if (problem.is_accepted === false) {
-				statusChip = '<span class="status-chip danger">未通过</span>';
-			}
 			row.innerHTML = `
 				<td>${problem.problem_id}</td>
 				<td>
 					<div class="title">${problem.title}</div>
-					<div class="meta">第 ${problem.page} 页 · ${statusChip}</div>
+					<div class="meta">第 ${problem.page} 页 · ${renderStatusChip(problem.is_accepted)}</div>
 				</td>
 				<td>${solved} / ${submitted}</td>
 				<td>${acceptance}</td>
@@ -471,6 +621,12 @@ function renderSubmissionState() {
 		if (Number.isFinite(numericId) && !Number.isNaN(numericId)) {
 			state.currentProblemId = numericId;
 		}
+		state.samples = {
+			input: problem.sample_input ? String(problem.sample_input) : '',
+			output: problem.sample_output ? String(problem.sample_output) : '',
+		};
+		resetSampleTestUI();
+		updateSampleTestAvailability();
 		const sections = [];
 		const seenContent = new Set();
 		const pushSection = (title, rawValue, formatter = formatParagraph) => {
@@ -488,7 +644,18 @@ function renderSubmissionState() {
 		pushSection('题目描述', problem.description);
 		pushSection('输入说明', problem.input);
 		pushSection('输出说明', problem.output);
-		pushSection('样例输入', problem.sample_input, (value) => `<pre>${escapeHtml(value)}</pre>`);
+		pushSection(
+			'样例输入',
+			problem.sample_input,
+			(value) => `
+				<div class="sample-block">
+					<div class="sample-actions">
+						<button type="button" class="sample-run-btn">使用样例快速测试</button>
+					</div>
+					<pre>${escapeHtml(value)}</pre>
+				</div>
+			`,
+		);
 		pushSection('样例输出', problem.sample_output, (value) => `<pre>${escapeHtml(value)}</pre>`);
 		pushSection('提示', problem.hint);
 
@@ -550,6 +717,7 @@ function renderSubmissionState() {
 			: '';
 
 		problemOutput.innerHTML = `${headerHtml}${metaHtml}${sectionsHtml}${tagsHtml}`;
+		updateSampleTestAvailability();
 		if (state.currentProblemId !== null) {
 			highlightProblemRow(state.currentProblemId);
 		}
@@ -585,8 +753,9 @@ function renderSubmissionState() {
 	loginForm.addEventListener('submit', (event) => {
 		event.preventDefault();
 		const formData = new FormData(loginForm);
-		const username = formData.get('username');
-		const password = formData.get('password');
+		const username = String(formData.get('username') ?? '');
+		const password = String(formData.get('password') ?? '');
+		const remember = rememberCheckbox ? rememberCheckbox.checked : true;
 		setStatus(loginStatus, '登录中…');
 		if (loginPanel) {
 			loginPanel.open = true;
@@ -594,7 +763,7 @@ function renderSubmissionState() {
 		updateLoginSummary('登录中…');
 		vscode.postMessage({
 			type: 'login',
-			payload: { username, password },
+			payload: { username, password, remember },
 		});
 	});
 
@@ -692,20 +861,63 @@ function renderSubmissionState() {
 		});
 	});
 
+	if (sampleTestButton) {
+		sampleTestButton.addEventListener('click', (event) => {
+			event.preventDefault();
+			triggerSampleTest();
+		});
+	}
+
+	if (problemOutput) {
+		problemOutput.addEventListener('click', (event) => {
+			const target = event.target.closest('.sample-run-btn');
+			if (!target) {
+				return;
+			}
+			event.preventDefault();
+			triggerSampleTest();
+		});
+	}
+
 	window.addEventListener('message', (event) => {
 		const message = event.data;
 		switch (message.type) {
 			case 'loginSuccess':
 				state.loggedIn = true;
 				state.pendingRestore = false;
+				state.rememberPassword = message.rememberPassword !== false;
+				if (rememberCheckbox) {
+					rememberCheckbox.checked = state.rememberPassword;
+				}
+				const usernameField = loginForm.querySelector('input[name="username"]');
+				if (usernameField) {
+					usernameField.value = message.userId ?? '';
+				}
+				const passwordField = loginForm.querySelector('input[name="password"]');
+				if (passwordField) {
+					passwordField.value = '';
+				}
 				setStatus(loginStatus, `已登录为 ${message.userId}`);
 				collapseLoginPanel(message.userId, false);
 				clearCurrentProblem({ notifyExtension: false });
+				resetSampleTestUI();
 				break;
 			case 'sessionRestored':
 				state.loggedIn = true;
 				const numericId = Number(message.currentProblemId);
 				state.currentProblemId = Number.isFinite(numericId) ? numericId : null;
+				state.rememberPassword = message.rememberPassword !== false;
+				if (rememberCheckbox) {
+					rememberCheckbox.checked = state.rememberPassword;
+				}
+				const restoredUserField = loginForm.querySelector('input[name="username"]');
+				if (restoredUserField) {
+					restoredUserField.value = message.userId ?? '';
+				}
+				const restoredPasswordField = loginForm.querySelector('input[name="password"]');
+				if (restoredPasswordField) {
+					restoredPasswordField.value = '';
+				}
 				const problemsetState = message.problemset ?? null;
 				const cachedProblem = message.lastProblem ?? null;
 				const cachedProblemValid = Boolean(
@@ -731,6 +943,7 @@ function renderSubmissionState() {
 				} else if (state.currentProblemId !== null && !(problemsetState && problemsetState.data)) {
 					highlightProblemRow(state.currentProblemId);
 				}
+				resetSampleTestUI();
 				break;
 			case 'problemset':
 				renderProblemset(message.payload);
@@ -758,6 +971,12 @@ function renderSubmissionState() {
 				}
 				state.submission.loading = false;
 				state.submission.error = null;
+				if (state.currentProblemId !== null && state.submission.final) {
+					const finalCode = Number(state.submission.final.result_code);
+					if (Number.isFinite(finalCode) && finalCode === 4) {
+						updateProblemCompletion(state.currentProblemId, true);
+					}
+				}
 				renderSubmissionState();
 				break;
 			case 'error':
@@ -772,6 +991,26 @@ function renderSubmissionState() {
 					renderSubmissionState();
 				}
 				break;
+			case 'savedCredentials':
+				state.loggedIn = false;
+				state.rememberPassword = message.rememberPassword !== false;
+				if (rememberCheckbox) {
+					rememberCheckbox.checked = state.rememberPassword;
+				}
+				const savedUserField = loginForm.querySelector('input[name="username"]');
+				if (savedUserField) {
+					savedUserField.value = message.userId ?? '';
+				}
+				const savedPasswordField = loginForm.querySelector('input[name="password"]');
+				if (savedPasswordField) {
+					savedPasswordField.value = '';
+				}
+				setStatus(loginStatus, '自动登录未成功，请手动登录', true);
+				expandLoginPanel();
+				break;
+			case 'sampleTestResult':
+				renderSampleTestResult(message.payload);
+				break;
 			default:
 				console.warn('未知消息', message);
 		}
@@ -780,3 +1019,5 @@ function renderSubmissionState() {
 	populateLanguages();
 	expandLoginPanel();
 	resetSubmissionState();
+	resetSampleTestUI();
+	updateSampleTestAvailability();

@@ -46,6 +46,58 @@ JUDGE_STATUS = {
     17: "远程判题",
 }
 
+AUTH_REQUIRED_ERROR = "AUTH_REQUIRED"
+
+
+def _normalize_newlines(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _normalize_paragraph(value: str) -> str:
+    text = _normalize_newlines(value).replace("\xa0", " ")
+    raw_lines = [line.replace("\xa0", " ") for line in text.split("\n")]
+    normalized: List[str] = []
+    blank_pending = False
+    for raw_line in raw_lines:
+        candidate = raw_line.rstrip()
+        if candidate:
+            normalized.append(candidate)
+            blank_pending = False
+        elif normalized and not blank_pending:
+            normalized.append("")
+            blank_pending = True
+    while normalized and not normalized[-1]:
+        normalized.pop()
+    return "\n".join(normalized)
+
+
+def _normalize_sample(value: str) -> str:
+    text = _normalize_newlines(value)
+    lines = [line.rstrip().replace("\xa0", " ") for line in text.split("\n")]
+    normalized: List[str] = []
+    blank_pending = False
+    for line in lines:
+        if line:
+            normalized.append(line)
+            blank_pending = False
+        elif normalized and not blank_pending:
+            normalized.append("")
+            blank_pending = True
+    while normalized and not normalized[-1]:
+        normalized.pop()
+    return "\n".join(normalized)
+
+
+def _ensure_authenticated(response: requests.Response, soup: Optional[bs4.BeautifulSoup] = None) -> None:
+    final_url = (response.url or "").lower()
+    if "login.php" in final_url:
+        raise PermissionError(AUTH_REQUIRED_ERROR)
+    if soup is None:
+        return
+    login_form = soup.select_one('form[action*="login.php"]')
+    if login_form is not None:
+        raise PermissionError(AUTH_REQUIRED_ERROR)
+
 
 def _configure_io():
     if hasattr(sys.stdout, "reconfigure"):
@@ -65,7 +117,7 @@ def _build_session(cookies: Optional[Dict[str, str]] = None) -> requests.Session
     return session
 
 
-def login(username, password):
+def login(username, secret, is_hashed=False):
     session = _build_session()
 
     csrf_url = urljoin(BASE_URL, "csrf.php")
@@ -75,13 +127,14 @@ def login(username, password):
     response.raise_for_status()
 
     soup = bs4.BeautifulSoup(response.text, "html.parser")
+    _ensure_authenticated(response, soup)
     csrf_input = soup.find("input", attrs={"name": "csrf"})
     if csrf_input is None or not csrf_input.get("value"):
         raise ValueError("Unable to locate CSRF token in response")
 
     csrf_token = csrf_input["value"]
 
-    password_hash = hashlib.md5(password.encode("utf-8")).hexdigest()
+    password_hash = secret if is_hashed else hashlib.md5(secret.encode("utf-8")).hexdigest()
 
     payload = {
         "user_id": username,
@@ -118,6 +171,7 @@ def fetch_problemset(session, start_page=1, max_pages=None):
         response.raise_for_status()
 
         soup = bs4.BeautifulSoup(response.text, "html.parser")
+        _ensure_authenticated(response, soup)
         rows = soup.select("table.ui.very.basic.center.aligned.table tbody tr")
 
         problems = []
@@ -239,7 +293,7 @@ def _collect_sections(soup: bs4.BeautifulSoup) -> Dict[str, str]:
         if segment is None:
             continue
 
-        text = segment.get_text("\n", strip=False).strip()
+        text = segment.get_text("\n", strip=False)
         sections[title] = text
 
     return sections
@@ -277,19 +331,26 @@ def fetch_problem(session, problem_id):
                 return value
         return None
 
+    def _clean_value(key: str, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if key in {"sample_input", "sample_output"}:
+            return _normalize_sample(value)
+        return _normalize_paragraph(value)
+
     problem_data = {
         "problem_id": header_info.get("problem_id") or str(problem_id),
         "title": header_info.get("title"),
         "metadata": metadata,
-        "description": _get_section_value("description"),
-        "input": _get_section_value("input"),
-        "output": _get_section_value("output"),
-        "sample_input": _get_section_value("sample_input"),
-        "sample_output": _get_section_value("sample_output"),
-        "hint": _get_section_value("hint"),
-        "source": _get_section_value("source"),
+        "description": _clean_value("description", _get_section_value("description")),
+        "input": _clean_value("input", _get_section_value("input")),
+        "output": _clean_value("output", _get_section_value("output")),
+        "sample_input": _clean_value("sample_input", _get_section_value("sample_input")),
+        "sample_output": _clean_value("sample_output", _get_section_value("sample_output")),
+        "hint": _clean_value("hint", _get_section_value("hint")),
+        "source": _clean_value("source", _get_section_value("source")),
         "tags": tags,
-        "raw_sections": sections,
+        "raw_sections": {title: _normalize_paragraph(value) for title, value in sections.items()},
         "url": problem_url,
     }
 
@@ -303,6 +364,7 @@ def fetch_status_list(session, user_id, limit=20):
     response.raise_for_status()
 
     soup = bs4.BeautifulSoup(response.text, "html.parser")
+    _ensure_authenticated(response, soup)
     return _parse_status_entries(soup, limit)
 
 
@@ -437,6 +499,7 @@ def _prepare_submit_payload(session, problem_id, language, source_code, contest_
     response.raise_for_status()
 
     soup = bs4.BeautifulSoup(response.text, "html.parser")
+    _ensure_authenticated(response, soup)
     form = soup.find("form", id="submit_code")
     if form is None:
         form = soup.find("form", attrs={"action": "submit.php"})
@@ -572,9 +635,15 @@ def _handle_action(request: Dict[str, Any]) -> Dict[str, Any]:
     if action == "login":
         username = request.get("username")
         password = request.get("password")
-        if not username or not password:
-            raise ValueError("username and password are required")
-        session, cookies = login(username, password)
+        password_hash = request.get("password_hash")
+        if not username:
+            raise ValueError("username is required")
+        if password:
+            session, cookies = login(username, password, is_hashed=False)
+        elif password_hash:
+            session, cookies = login(username, password_hash, is_hashed=True)
+        else:
+            raise ValueError("password or password_hash is required")
         return {"cookies": cookies}
 
     cookies = request.get("cookies")

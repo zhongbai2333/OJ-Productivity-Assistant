@@ -106,6 +106,24 @@ label {
 	font-weight: 600;
 }
 
+.remember-toggle {
+	flex-direction: row;
+	align-items: center;
+	font-weight: 500;
+	gap: 8px;
+}
+
+.remember-toggle span {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	font-weight: 400;
+}
+
+.remember-toggle input {
+	margin: 0;
+}
+
 input,
 select,
 button {
@@ -254,6 +272,17 @@ th.placeholder {
 	word-break: break-word;
 }
 
+.sample-block {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.sample-block .sample-actions {
+	display: flex;
+	justify-content: flex-end;
+}
+
 .problem-header {
 	display: flex;
 	flex-direction: column;
@@ -313,6 +342,12 @@ th.placeholder {
 	margin-top: 0;
 	margin-bottom: 8px;
 	font-size: 1rem;
+}
+
+.problem-sections section p {
+	margin: 0 0 8px;
+	white-space: pre-wrap;
+	word-break: break-word;
 }
 
 .tag-list {

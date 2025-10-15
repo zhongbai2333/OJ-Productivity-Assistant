@@ -1,8 +1,8 @@
+import * as crypto from 'crypto';
 import * as path from 'path';
+import { spawn } from 'child_process';
 import * as vscode from 'vscode';
 import { PythonService } from './pythonService';
-
-const SESSION_EXPIRY_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 interface PersistedProblemsetState {
     readonly data: Record<string, unknown>;
@@ -17,8 +17,9 @@ interface PersistedProblemState {
 
 interface PersistedSession {
     savedAt: number;
-    cookies: Record<string, string>;
     userId: string;
+    rememberPassword: boolean;
+    passwordHash?: string;
     currentProblemId?: number;
     problemset?: PersistedProblemsetState;
     lastProblem?: PersistedProblemState;
@@ -30,13 +31,14 @@ interface SessionState {
 }
 
 type WebviewMessage =
-    | { type: 'login'; payload: { username: string; password: string } }
+    | { type: 'login'; payload: { username: string; password: string; remember: boolean } }
     | { type: 'fetchProblemset'; payload: { startPage: number; maxPages?: number | null } }
     | { type: 'fetchProblem'; payload: { problemId: number } }
     | { type: 'fetchStatus'; payload: { limit: number } }
     | { type: 'createFile'; payload: { problemId: number; language: string } }
     | { type: 'submitSolution'; payload: { problemId: number; language: string; filePath: string; contestProblemId?: number | null } }
-    | { type: 'selectProblem'; payload: { problemId: number | null } };
+    | { type: 'selectProblem'; payload: { problemId: number | null } }
+    | { type: 'runSampleTest'; payload: { problemId: number | null; language: string; filePath: string; sampleInput: string; expectedOutput?: string | null } };
 
 export function activate(context: vscode.ExtensionContext) {
     const provider = new OJAssistantProvider(context);
@@ -59,6 +61,8 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
     private session: SessionState | undefined;
     private currentProblemId: number | null = null;
     private sessionRestorePromise: Promise<void> | undefined;
+    private savedCredentials: { userId: string; passwordHash?: string; rememberPassword: boolean } | undefined;
+    private autoLoginPromise: Promise<boolean> | undefined;
     private readonly stateDirName = '.oj-assistant';
     private readonly stateFileName = 'session.json';
     private warnedMissingWorkspace = false;
@@ -93,7 +97,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         try {
             switch (message.type) {
                 case 'login':
-                    await this.handleLogin(message.payload.username, message.payload.password);
+                    await this.handleLogin(message.payload.username, message.payload.password, message.payload.remember);
                     break;
                 case 'fetchProblemset':
                     await this.handleFetchProblemset(message.payload.startPage, message.payload.maxPages ?? undefined);
@@ -118,6 +122,15 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 case 'selectProblem':
                     await this.handleSelectProblem(message.payload.problemId);
                     break;
+                case 'runSampleTest':
+                    await this.handleRunSampleTest(
+                        message.payload.problemId,
+                        message.payload.language,
+                        message.payload.filePath,
+                        message.payload.sampleInput,
+                        message.payload.expectedOutput ?? undefined,
+                    );
+                    break;
                 default:
                     throw new Error(`未知消息类型: ${(message as { type: string }).type}`);
             }
@@ -127,26 +140,29 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async handleLogin(username: string, password: string): Promise<void> {
+    private async handleLogin(username: string, password: string, remember: boolean): Promise<void> {
         const data = await this.python.execute<{ cookies: Record<string, string> }>('login', {
             username,
             password,
         });
         this.session = { cookies: data.cookies, userId: username };
         this.currentProblemId = null;
-        await this.saveSession(this.session, null);
-        this.postMessage({ type: 'loginSuccess', userId: username });
+        const passwordHash = remember ? this.hashPassword(password) : undefined;
+        await this.recordLogin(username, remember, passwordHash, { clearCachedData: true });
+        this.postMessage({ type: 'loginSuccess', userId: username, rememberPassword: remember });
     }
 
     private async handleFetchProblemset(startPage: number, maxPages?: number): Promise<void> {
-        const session = await this.ensureSession();
         const normalizedStartPage = Math.max(1, startPage);
         const effectiveMaxPages = typeof maxPages === 'number' && !Number.isNaN(maxPages) ? Math.max(1, maxPages) : 1;
-        const data = await this.python.execute<{ problemset: Record<string, unknown> }>('fetch_problemset', {
-            cookies: session.cookies,
-            start_page: normalizedStartPage,
-            max_pages: effectiveMaxPages,
-        });
+        const data = await this.executeWithSession((session) =>
+            this.python.execute<{ problemset: Record<string, unknown> }>('fetch_problemset', {
+                cookies: session.cookies,
+                start_page: normalizedStartPage,
+                max_pages: effectiveMaxPages,
+            }),
+        );
+
         this.postMessage({ type: 'problemset', payload: data.problemset });
         await this.mutatePersistedSession((persisted) => {
             persisted.problemset = {
@@ -160,12 +176,13 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
     }
 
     private async handleFetchProblem(problemId: number): Promise<void> {
-        const session = await this.ensureSession();
         this.currentProblemId = problemId;
-        const data = await this.python.execute<{ problem: unknown }>('fetch_problem', {
-            cookies: session.cookies,
-            problem_id: problemId,
-        });
+        const data = await this.executeWithSession((session) =>
+            this.python.execute<{ problem: unknown }>('fetch_problem', {
+                cookies: session.cookies,
+                problem_id: problemId,
+            }),
+        );
         this.postMessage({ type: 'problem', payload: data.problem });
         await this.mutatePersistedSession((persisted) => {
             persisted.currentProblemId = problemId;
@@ -182,12 +199,13 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
     }
 
     private async handleFetchStatus(limit: number): Promise<void> {
-        const session = await this.ensureSession();
-        const data = await this.python.execute<{ status: unknown }>('fetch_status', {
-            cookies: session.cookies,
-            user_id: session.userId,
-            limit,
-        });
+        const data = await this.executeWithSession((session) =>
+            this.python.execute<{ status: unknown }>('fetch_status', {
+                cookies: session.cookies,
+                user_id: session.userId,
+                limit,
+            }),
+        );
         this.postMessage({ type: 'status', payload: data.status });
     }
 
@@ -220,31 +238,157 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
     }
 
     private async handleSubmitSolution(problemId: number, language: string, filePath: string, contestProblemId?: number): Promise<void> {
-        const session = await this.ensureSession();
-        const languageCode = this.getLanguageCode(language);
-        const fileUri = this.resolveFileUri(filePath);
-        const sourceBuffer = await vscode.workspace.fs.readFile(fileUri);
-        const sourceCode = Buffer.from(sourceBuffer).toString('utf8');
+        await this.withAutoRelogin(async () => {
+            const session = await this.ensureSession();
+            const languageCode = this.getLanguageCode(language);
+            const fileUri = this.resolveFileUri(filePath);
+            const sourceBuffer = await vscode.workspace.fs.readFile(fileUri);
+            const sourceCode = Buffer.from(sourceBuffer).toString('utf8');
 
-        const submission = await this.python.execute<{ submission: { solution_id?: number } }>('submit_solution', {
-            cookies: session.cookies,
-            user_id: session.userId,
-            problem_id: problemId,
-            source_code: sourceCode,
-            language: languageCode,
-            contest_problem_id: contestProblemId ?? 0,
-        });
-
-        this.postMessage({ type: 'submission', payload: submission.submission });
-
-        const solutionId = submission.submission.solution_id;
-        if (typeof solutionId === 'number') {
-            const finalStatus = await this.python.execute<{ status: unknown }>('poll_submission', {
+            const submission = await this.python.execute<{ submission: { solution_id?: number } }>('submit_solution', {
                 cookies: session.cookies,
-                solution_id: solutionId,
+                user_id: session.userId,
+                problem_id: problemId,
+                source_code: sourceCode,
+                language: languageCode,
+                contest_problem_id: contestProblemId ?? 0,
             });
-            this.postMessage({ type: 'submissionStatus', payload: finalStatus.status });
+
+            this.postMessage({ type: 'submission', payload: submission.submission });
+
+            const solutionId = submission.submission.solution_id;
+            if (typeof solutionId === 'number') {
+                const finalStatus = await this.python.execute<{ status: unknown }>('poll_submission', {
+                    cookies: session.cookies,
+                    solution_id: solutionId,
+                });
+                this.postMessage({ type: 'submissionStatus', payload: finalStatus.status });
+            }
+        });
+    }
+
+    private async handleRunSampleTest(
+        problemId: number | null,
+        language: string,
+        filePath: string,
+        sampleInput: string,
+        expectedOutput?: string,
+    ): Promise<void> {
+        try {
+            if (!filePath) {
+                throw new Error('请先指定代码文件路径');
+            }
+            if (!sampleInput) {
+                throw new Error('当前题目缺少样例输入');
+            }
+            const fileUri = this.resolveFileUri(filePath);
+            const exists = await this.fileExists(fileUri);
+            if (!exists) {
+                throw new Error('代码文件不存在，请先创建或保存后再试');
+            }
+
+            const result = await this.runSampleTest(language, fileUri.fsPath, sampleInput, expectedOutput);
+            this.postMessage({
+                type: 'sampleTestResult',
+                payload: {
+                    ok: true,
+                    language,
+                    filePath,
+                    problemId,
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    exitCode: result.exitCode,
+                    matched: result.matched,
+                    expectedOutput: expectedOutput ?? null,
+                },
+            });
+        } catch (error) {
+            this.postMessage({
+                type: 'sampleTestResult',
+                payload: {
+                    ok: false,
+                    language,
+                    filePath,
+                    problemId,
+                    error: (error as Error).message,
+                },
+            });
         }
+    }
+
+    private async runSampleTest(
+        language: string,
+        filePath: string,
+        sampleInput: string,
+        expectedOutput?: string,
+    ): Promise<{ stdout: string; stderr: string; exitCode: number | null; matched?: boolean }> {
+        switch (language) {
+            case 'python':
+                return this.runPythonSample(filePath, sampleInput, expectedOutput);
+            default:
+                throw new Error(`暂未支持 ${language} 语言的快速测试`);
+        }
+    }
+
+    private async runPythonSample(
+        filePath: string,
+        sampleInput: string,
+        expectedOutput?: string,
+    ): Promise<{ stdout: string; stderr: string; exitCode: number | null; matched?: boolean }> {
+        const pythonPath = vscode.workspace.getConfiguration('ojAssistant').get<string>('pythonPath', 'python');
+        const result = await this.runProcess(pythonPath, [filePath], sampleInput, path.dirname(filePath));
+        const normalizedStdout = this.normalizeProgramOutput(result.stdout);
+        const normalizedExpected = expectedOutput === undefined ? undefined : this.normalizeProgramOutput(expectedOutput);
+        const matched = normalizedExpected !== undefined ? normalizedStdout === normalizedExpected : undefined;
+        return {
+            stdout: result.stdout,
+            stderr: result.stderr,
+            exitCode: result.exitCode,
+            matched,
+        };
+    }
+
+    private async runProcess(
+        command: string,
+        args: readonly string[],
+        input: string,
+        cwd: string,
+    ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+        return new Promise((resolve, reject) => {
+            const child = spawn(command, [...args], {
+                cwd,
+                shell: false,
+            });
+
+            let stdout = '';
+            let stderr = '';
+
+            child.stdout.on('data', (data: Buffer) => {
+                stdout += data.toString();
+            });
+
+            child.stderr.on('data', (data: Buffer) => {
+                stderr += data.toString();
+            });
+
+            child.on('error', (error) => {
+                reject(error);
+            });
+
+            child.on('close', (code) => {
+                resolve({ stdout, stderr, exitCode: code });
+            });
+
+            if (input) {
+                const normalizedInput = input.endsWith('\n') ? input : `${input}\n`;
+                child.stdin.write(normalizedInput);
+            }
+            child.stdin.end();
+        });
+    }
+
+    private normalizeProgramOutput(value: string): string {
+        return value.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trimEnd();
     }
 
     private postMessage(message: Record<string, unknown>): void {
@@ -332,7 +476,11 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         if (!dirUri) {
             return;
         }
-        const payload = JSON.stringify(session, null, 2);
+        const snapshot: PersistedSession = { ...session };
+        if (!snapshot.rememberPassword) {
+            delete snapshot.passwordHash;
+        }
+        const payload = JSON.stringify(snapshot, null, 2);
         await vscode.workspace.fs.writeFile(fileUri, Buffer.from(`${payload}
 `, 'utf8'));
     }
@@ -352,44 +500,135 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async saveSession(session: SessionState, problemId: number | null): Promise<void> {
-        this.currentProblemId = typeof problemId === 'number' ? problemId : null;
-        const persist: PersistedSession = {
-            savedAt: Date.now(),
-            cookies: session.cookies,
-            userId: session.userId,
-        };
-        if (typeof problemId === 'number') {
-            persist.currentProblemId = problemId;
-        }
-        delete persist.problemset;
-        delete persist.lastProblem;
-        await this.writePersistedSession(persist);
+    private async recordLogin(
+        userId: string,
+        rememberPassword: boolean,
+        passwordHash: string | undefined,
+        options?: { clearCachedData?: boolean },
+    ): Promise<void> {
+        this.savedCredentials = { userId, passwordHash, rememberPassword };
+        const clearCachedData = options?.clearCachedData ?? false;
+        await this.mutatePersistedSession((state) => {
+            state.userId = userId;
+            state.rememberPassword = rememberPassword;
+            if (rememberPassword && passwordHash) {
+                state.passwordHash = passwordHash;
+            } else {
+                delete state.passwordHash;
+            }
+            if (clearCachedData) {
+                delete state.problemset;
+                delete state.lastProblem;
+                delete state.currentProblemId;
+            }
+        });
     }
 
     private async mutatePersistedSession(mutator: (session: PersistedSession) => void): Promise<void> {
-        if (!this.session) {
-            return;
-        }
         let persisted = await this.readPersistedSession();
         if (!persisted) {
             persisted = {
                 savedAt: Date.now(),
-                cookies: this.session.cookies,
-                userId: this.session.userId,
+                userId: this.savedCredentials?.userId ?? this.session?.userId ?? '',
+                rememberPassword: this.savedCredentials?.rememberPassword ?? false,
             };
+            if (persisted.rememberPassword && this.savedCredentials?.passwordHash) {
+                persisted.passwordHash = this.savedCredentials.passwordHash;
+            }
         } else {
-            persisted.cookies = this.session.cookies;
-            persisted.userId = this.session.userId;
+            if (this.savedCredentials) {
+                persisted.userId = this.savedCredentials.userId;
+                persisted.rememberPassword = this.savedCredentials.rememberPassword;
+                if (this.savedCredentials.rememberPassword && this.savedCredentials.passwordHash) {
+                    persisted.passwordHash = this.savedCredentials.passwordHash;
+                } else {
+                    delete persisted.passwordHash;
+                }
+            }
         }
         mutator(persisted);
+        persisted.savedAt = Date.now();
         await this.writePersistedSession(persisted);
     }
 
-    private async updatePersistedCurrentProblem(problemId: number | null): Promise<void> {
-        if (!this.session) {
-            return;
+    private hashPassword(secret: string): string {
+        return crypto.createHash('md5').update(secret, 'utf8').digest('hex');
+    }
+
+    private async tryAutoLoginInternal(
+        userId: string,
+        passwordHash: string,
+        options?: { clearCachedData?: boolean },
+    ): Promise<boolean> {
+        try {
+            const data = await this.python.execute<{ cookies: Record<string, string> }>('login', {
+                username: userId,
+                password_hash: passwordHash,
+            });
+            this.session = { cookies: data.cookies, userId };
+            if (!options?.clearCachedData) {
+                this.currentProblemId = this.currentProblemId ?? null;
+            }
+            await this.recordLogin(userId, true, passwordHash, { clearCachedData: options?.clearCachedData ?? false });
+            return true;
+        } catch (error) {
+            this.session = undefined;
+            return false;
         }
+    }
+
+    private async tryAutoLogin(): Promise<boolean> {
+        if (!this.savedCredentials?.rememberPassword || !this.savedCredentials.passwordHash) {
+            return false;
+        }
+        if (!this.autoLoginPromise) {
+            this.autoLoginPromise = (async () => {
+                const success = await this.tryAutoLoginInternal(
+                    this.savedCredentials!.userId,
+                    this.savedCredentials!.passwordHash!,
+                    { clearCachedData: false },
+                );
+                if (!success) {
+                    await this.recordLogin(this.savedCredentials!.userId, false, undefined, { clearCachedData: false });
+                }
+                this.autoLoginPromise = undefined;
+                return success;
+            })();
+        }
+        return this.autoLoginPromise;
+    }
+
+    private shouldAttemptRelogin(error: unknown): boolean {
+        if (!error) {
+            return false;
+        }
+        const message = (error as Error).message ?? '';
+        if (!message) {
+            return false;
+        }
+        const normalized = message.toLowerCase();
+        return normalized.includes('auth_required') || normalized.includes('重新登录') || normalized.includes('请先登录');
+    }
+
+    private async withAutoRelogin<T>(operation: () => Promise<T>): Promise<T> {
+        try {
+            return await operation();
+        } catch (error) {
+            if (this.shouldAttemptRelogin(error) && (await this.tryAutoLogin())) {
+                return operation();
+            }
+            throw error;
+        }
+    }
+
+    private async executeWithSession<T>(operation: (session: SessionState) => Promise<T>): Promise<T> {
+        return this.withAutoRelogin(async () => {
+            const session = await this.ensureSession();
+            return operation(session);
+        });
+    }
+
+    private async updatePersistedCurrentProblem(problemId: number | null): Promise<void> {
         await this.mutatePersistedSession((persisted) => {
             if (typeof problemId === 'number') {
                 persisted.currentProblemId = problemId;
@@ -411,19 +650,38 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         if (!persisted) {
             return;
         }
-        if (Date.now() - persisted.savedAt > SESSION_EXPIRY_MS) {
-            await this.deletePersistedSession();
-            void vscode.window.showInformationMessage('登录状态已超过 2 小时限制，请重新登录。');
-            return;
-        }
-        this.session = { cookies: persisted.cookies, userId: persisted.userId };
-        this.currentProblemId = typeof persisted.currentProblemId === 'number' ? persisted.currentProblemId : null;
-        this.postMessage({
-            type: 'sessionRestored',
+        const rememberPassword = Boolean(persisted.rememberPassword);
+        const passwordHash = rememberPassword ? persisted.passwordHash : undefined;
+        this.savedCredentials = {
             userId: persisted.userId,
-            currentProblemId: this.currentProblemId,
-            problemset: persisted.problemset,
-            lastProblem: persisted.lastProblem,
+            rememberPassword,
+            passwordHash,
+        };
+
+        const cachedProblemId = typeof persisted.currentProblemId === 'number' ? persisted.currentProblemId : null;
+        const cachedProblemset = persisted.problemset;
+        const cachedProblem = persisted.lastProblem;
+
+        if (rememberPassword && passwordHash) {
+            const success = await this.tryAutoLoginInternal(persisted.userId, passwordHash, { clearCachedData: false });
+            if (success && this.session) {
+                this.currentProblemId = cachedProblemId;
+                this.postMessage({
+                    type: 'sessionRestored',
+                    userId: persisted.userId,
+                    rememberPassword: true,
+                    currentProblemId: this.currentProblemId,
+                    problemset: cachedProblemset,
+                    lastProblem: cachedProblem,
+                });
+                return;
+            }
+        }
+
+        this.postMessage({
+            type: 'savedCredentials',
+            userId: persisted.userId,
+            rememberPassword,
         });
     }
 
@@ -436,18 +694,18 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         return `<!DOCTYPE html>
 <html lang="zh-cn">
 <head>
-	<meta charset="UTF-8">
-	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<link rel="stylesheet" href="${styleUri}">
-	<title>OJ Productivity Assistant</title>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="${styleUri}">
+    <title>OJ Productivity Assistant</title>
 </head>
 <body>
-	<header>
-		<h1>OJ Productivity Assistant</h1>
-		<p>连接 2024.jdoj.tech，提升刷题效率。</p>
-	</header>
-	<main>
+    <header>
+        <h1>OJ Productivity Assistant</h1>
+        <p>连接 2024.jdoj.tech，提升刷题效率。</p>
+    </header>
+    <main>
         <section class="card collapsible-card" id="login-card">
             <details id="login-panel" open>
                 <summary id="login-summary">登录账号（点击展开）</summary>
@@ -458,47 +716,52 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                     <label>密码
                         <input type="password" name="password" required>
                     </label>
+                    <label class="remember-toggle">
+                        <span>
+                            <input type="checkbox" name="remember" checked>
+                            记住密码
+                        </span>
+                    </label>
                     <button type="submit">登录</button>
                 </form>
                 <div class="status" id="login-status"></div>
             </details>
         </section>
-		<section class="card" id="problemset">
-			<h2>题目列表</h2>
-			<form id="problemset-form">
-				<div class="form-row">
-					<label>起始页
-						<input type="number" name="startPage" min="1" value="1">
-					</label>
-					<label>最大页数
-						<input type="number" name="maxPages" min="1" placeholder="留空表示只获取一页">
-					</label>
-					<button type="submit">获取题单</button>
-				</div>
-			</form>
-			<div class="table-container">
-				<table id="problemset-table">
-					<thead>
-						<tr>
-							<th>编号</th>
-							<th>标题</th>
-							<th>通过/提交</th>
-							<th>通过率</th>
-						</tr>
-					</thead>
-					<tbody>
-						<tr>
-							<td colspan="4" class="placeholder">登录并点击“获取题单”加载数据</td>
-						</tr>
-					</tbody>
-				</table>
-			</div>
-		</section>
-		<section class="card" id="problem-detail">
-			<h2>题目详情</h2>
-			<div id="problem-output" class="problem-content">
-				<div class="placeholder">在题目列表中选择一题查看详情</div>
-			</div>
+        <section class="card" id="problemset">
+            <h2>题目列表</h2>
+            <form id="problemset-form">
+                <div class="form-row">
+                    <label>起始页
+                        <input type="number" name="startPage" min="1" value="1">
+                    </label>
+                    <label>最大页数
+                        <input type="number" name="maxPages" min="1" placeholder="留空表示只获取一页">
+                    </label>
+                    <button type="submit">获取题单</button>
+                </div>
+            </form>
+            <div class="table-container">
+                <table id="problemset-table">
+                    <thead>
+                        <tr>
+                            <th>编号</th>
+                            <th>标题</th>
+                            <th>通过/提交</th>
+                            <th>通过率</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td colspan="4" class="placeholder">登录并点击“获取题单”加载数据</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+        <section class="card" id="problem-detail">
+            <div id="problem-output" class="problem-content">
+                <div class="placeholder">在题目列表中选择一题查看详情</div>
+            </div>
             <div id="problem-actions" class="hidden">
                 <div class="action-block">
                     <h3>代码文件</h3>
@@ -519,42 +782,48 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                         <button type="submit">提交代码</button>
                     </form>
                 </div>
-			</div>
+                <div class="action-block" id="sample-test-block">
+                    <h3>样例测试</h3>
+                    <button type="button" id="sample-test-button">使用样例快速测试</button>
+                    <div class="status" id="sample-test-status"></div>
+                    <pre class="output hidden" id="sample-test-output"></pre>
+                </div>
+            </div>
             <div class="output submission-output" id="submission-output"></div>
-		</section>
-		<section class="card" id="status">
-			<h2>提交记录</h2>
-			<form id="status-form">
-				<div class="form-row">
-					<label>记录条数
-						<input type="number" name="limit" min="1" value="10">
-					</label>
-					<button type="submit">刷新</button>
-				</div>
-			</form>
-			<div class="table-container">
-				<table id="status-table">
-					<thead>
-						<tr>
-							<th>编号</th>
-							<th>题目</th>
-							<th>结果</th>
-							<th>耗时</th>
-							<th>内存</th>
-							<th>语言</th>
-							<th>提交时间</th>
-						</tr>
-					</thead>
-					<tbody>
-						<tr>
-							<td colspan="7" class="placeholder">登录后可刷新提交记录</td>
-						</tr>
-					</tbody>
-				</table>
-			</div>
-		</section>
-	</main>
-	<script nonce="${nonce}" src="${scriptUri}"></script>
+        </section>
+        <section class="card" id="status">
+            <h2>提交记录</h2>
+            <form id="status-form">
+                <div class="form-row">
+                    <label>记录条数
+                        <input type="number" name="limit" min="1" value="10">
+                    </label>
+                    <button type="submit">刷新</button>
+                </div>
+            </form>
+            <div class="table-container">
+                <table id="status-table">
+                    <thead>
+                        <tr>
+                            <th>编号</th>
+                            <th>题目</th>
+                            <th>结果</th>
+                            <th>耗时</th>
+                            <th>内存</th>
+                            <th>语言</th>
+                            <th>提交时间</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td colspan="7" class="placeholder">登录后可刷新提交记录</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+    <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
     }
