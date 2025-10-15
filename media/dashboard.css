@@ -146,6 +146,21 @@ button:hover {
 	background: var(--vscode-button-hoverBackground);
 }
 
+button:disabled {
+	opacity: 0.6;
+	cursor: default;
+}
+
+.secondary-button {
+	background: transparent;
+	border: 1px solid var(--vscode-button-border, var(--vscode-input-border));
+	color: var(--vscode-button-foreground);
+}
+
+.secondary-button:hover {
+	background: rgba(255, 255, 255, 0.08);
+}
+
 .status {
 	min-height: 24px;
 	font-size: 0.9rem;
@@ -270,6 +285,27 @@ th.placeholder {
 	border: 1px solid var(--vscode-editorWidget-border);
 	white-space: pre-wrap;
 	word-break: break-word;
+}
+
+.problem-toolbar {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	margin-bottom: 8px;
+}
+
+.problem-navigation {
+	display: flex;
+	gap: 12px;
+	margin-top: 16px;
+}
+
+.problem-navigation button {
+	flex: 1;
+}
+
+.problem-navigation button:disabled {
+	opacity: 0.6;
 }
 
 .sample-block {

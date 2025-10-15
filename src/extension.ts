@@ -31,14 +31,15 @@ interface SessionState {
 }
 
 type WebviewMessage =
-    | { type: 'login'; payload: { username: string; password: string; remember: boolean } }
+    | { type: 'login'; payload: { username: string; password: string; remember: boolean; useSavedPassword?: boolean } }
     | { type: 'fetchProblemset'; payload: { startPage: number; maxPages?: number | null } }
     | { type: 'fetchProblem'; payload: { problemId: number } }
     | { type: 'fetchStatus'; payload: { limit: number } }
     | { type: 'createFile'; payload: { problemId: number; language: string } }
     | { type: 'submitSolution'; payload: { problemId: number; language: string; filePath: string; contestProblemId?: number | null } }
     | { type: 'selectProblem'; payload: { problemId: number | null } }
-    | { type: 'runSampleTest'; payload: { problemId: number | null; language: string; filePath: string; sampleInput: string; expectedOutput?: string | null } };
+    | { type: 'runSampleTest'; payload: { problemId: number | null; language: string; filePath: string; sampleInput: string; expectedOutput?: string | null } }
+    | { type: 'updateProblemStatus'; payload: { problemId: number; accepted: boolean } };
 
 export function activate(context: vscode.ExtensionContext) {
     const provider = new OJAssistantProvider(context);
@@ -97,7 +98,12 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         try {
             switch (message.type) {
                 case 'login':
-                    await this.handleLogin(message.payload.username, message.payload.password, message.payload.remember);
+                    await this.handleLogin(
+                        message.payload.username,
+                        message.payload.password,
+                        message.payload.remember,
+                        message.payload.useSavedPassword ?? false,
+                    );
                     break;
                 case 'fetchProblemset':
                     await this.handleFetchProblemset(message.payload.startPage, message.payload.maxPages ?? undefined);
@@ -131,6 +137,9 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                         message.payload.expectedOutput ?? undefined,
                     );
                     break;
+                case 'updateProblemStatus':
+                    await this.handleUpdateProblemStatus(message.payload.problemId, message.payload.accepted);
+                    break;
                 default:
                     throw new Error(`未知消息类型: ${(message as { type: string }).type}`);
             }
@@ -140,16 +149,47 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async handleLogin(username: string, password: string, remember: boolean): Promise<void> {
-        const data = await this.python.execute<{ cookies: Record<string, string> }>('login', {
-            username,
-            password,
-        });
-        this.session = { cookies: data.cookies, userId: username };
+    private async handleLogin(username: string, password: string, remember: boolean, useSavedPassword: boolean): Promise<void> {
+        const trimmedUsername = username.trim();
+        if (!trimmedUsername) {
+            throw new Error('请填写用户名');
+        }
+
+        let passwordHash: string | undefined;
+        let cookies: Record<string, string>;
+
+        if (useSavedPassword) {
+            const saved = this.savedCredentials;
+            if (!saved || !saved.passwordHash || saved.userId !== trimmedUsername) {
+                throw new Error('未找到已保存的密码，请重新输入密码');
+            }
+            const data = await this.python.execute<{ cookies: Record<string, string> }>('login', {
+                username: trimmedUsername,
+                password_hash: saved.passwordHash,
+            });
+            cookies = data.cookies;
+            passwordHash = remember ? saved.passwordHash : undefined;
+        } else {
+            if (!password) {
+                throw new Error('请填写密码');
+            }
+            const data = await this.python.execute<{ cookies: Record<string, string> }>('login', {
+                username: trimmedUsername,
+                password,
+            });
+            cookies = data.cookies;
+            passwordHash = remember ? this.hashPassword(password) : undefined;
+        }
+
+        this.session = { cookies, userId: trimmedUsername };
         this.currentProblemId = null;
-        const passwordHash = remember ? this.hashPassword(password) : undefined;
-        await this.recordLogin(username, remember, passwordHash, { clearCachedData: true });
-        this.postMessage({ type: 'loginSuccess', userId: username, rememberPassword: remember });
+        await this.recordLogin(trimmedUsername, remember, passwordHash, { clearCachedData: true });
+        this.postMessage({
+            type: 'loginSuccess',
+            userId: trimmedUsername,
+            rememberPassword: remember,
+            hasSavedPassword: this.hasSavedPassword(),
+        });
     }
 
     private async handleFetchProblemset(startPage: number, maxPages?: number): Promise<void> {
@@ -163,7 +203,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
             }),
         );
 
-        this.postMessage({ type: 'problemset', payload: data.problemset });
+    this.postMessage({ type: 'problemset', payload: data.problemset });
         await this.mutatePersistedSession((persisted) => {
             persisted.problemset = {
                 data: data.problemset,
@@ -206,7 +246,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 limit,
             }),
         );
-        this.postMessage({ type: 'status', payload: data.status });
+    this.postMessage({ type: 'status', payload: data.status });
     }
 
     private async handleCreateFile(problemId: number, language: string): Promise<void> {
@@ -314,6 +354,37 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 },
             });
         }
+    }
+
+    private async handleUpdateProblemStatus(problemId: number, accepted: boolean): Promise<void> {
+        const numericId = Number(problemId);
+        if (!Number.isFinite(numericId)) {
+            return;
+        }
+
+        await this.mutatePersistedSession((persisted) => {
+            const problemsetData = persisted.problemset?.data;
+            if (!problemsetData || typeof problemsetData !== 'object') {
+                return;
+            }
+
+            for (const value of Object.values(problemsetData)) {
+                if (!Array.isArray(value)) {
+                    continue;
+                }
+                for (const entry of value) {
+                    if (!entry || typeof entry !== 'object') {
+                        continue;
+                    }
+                    const problemRecord = entry as { problem_id?: number | string; [key: string]: unknown };
+                    const entryId = Number(problemRecord.problem_id);
+                    if (!Number.isFinite(entryId) || entryId !== numericId) {
+                        continue;
+                    }
+                    problemRecord.is_accepted = accepted;
+                }
+            }
+        });
     }
 
     private async runSampleTest(
@@ -555,6 +626,10 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         return crypto.createHash('md5').update(secret, 'utf8').digest('hex');
     }
 
+    private hasSavedPassword(): boolean {
+        return Boolean(this.savedCredentials?.passwordHash);
+    }
+
     private async tryAutoLoginInternal(
         userId: string,
         passwordHash: string,
@@ -673,6 +748,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                     currentProblemId: this.currentProblemId,
                     problemset: cachedProblemset,
                     lastProblem: cachedProblem,
+                    hasSavedPassword: this.hasSavedPassword(),
                 });
                 return;
             }
@@ -682,6 +758,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
             type: 'savedCredentials',
             userId: persisted.userId,
             rememberPassword,
+            hasSavedPassword: this.hasSavedPassword(),
         });
     }
 
@@ -723,6 +800,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                         </span>
                     </label>
                     <button type="submit">登录</button>
+                    <button type="button" id="use-saved-password" class="secondary-button hidden">使用已保存的密码</button>
                 </form>
                 <div class="status" id="login-status"></div>
             </details>
@@ -759,6 +837,9 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
             </div>
         </section>
         <section class="card" id="problem-detail">
+            <div class="problem-toolbar hidden" id="problem-toolbar">
+                <button type="button" id="toolbar-open-file">打开代码文件</button>
+            </div>
             <div id="problem-output" class="problem-content">
                 <div class="placeholder">在题目列表中选择一题查看详情</div>
             </div>
@@ -790,6 +871,10 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 </div>
             </div>
             <div class="output submission-output" id="submission-output"></div>
+            <div class="problem-navigation hidden" id="problem-navigation">
+                <button type="button" id="nav-prev-button">上一题</button>
+                <button type="button" id="nav-next-button">下一题</button>
+            </div>
         </section>
         <section class="card" id="status">
             <h2>提交记录</h2>

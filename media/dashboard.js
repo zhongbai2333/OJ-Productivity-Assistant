@@ -18,7 +18,6 @@ const METADATA_LABEL_ALIASES = {
 	'submit': '提交数',
 	'solved': '通过数',
 };
-
 const state = {
 	loggedIn: false,
 	problemset: [],
@@ -26,6 +25,8 @@ const state = {
 	pendingRestore: false,
 	problemsetRequest: null,
 	rememberPassword: true,
+	hasSavedPassword: false,
+	savedUserId: '',
 	samples: {
 		input: '',
 		output: '',
@@ -45,6 +46,7 @@ const loginSummary = document.getElementById('login-summary');
 const loginForm = document.getElementById('login-form');
 const loginStatus = document.getElementById('login-status');
 const rememberCheckbox = loginForm.querySelector('input[name="remember"]');
+const useSavedPasswordButton = document.getElementById('use-saved-password');
 const problemsetForm = document.getElementById('problemset-form');
 const problemsetTable = document.getElementById('problemset-table');
 const problemsetBody = problemsetTable.querySelector('tbody');
@@ -62,6 +64,43 @@ const statusBody = statusTable.querySelector('tbody');
 const sampleTestButton = document.getElementById('sample-test-button');
 const sampleTestStatus = document.getElementById('sample-test-status');
 const sampleTestOutput = document.getElementById('sample-test-output');
+const problemToolbar = document.getElementById('problem-toolbar');
+const toolbarOpenButton = document.getElementById('toolbar-open-file');
+const problemNavigation = document.getElementById('problem-navigation');
+const navPrevButton = document.getElementById('nav-prev-button');
+const navNextButton = document.getElementById('nav-next-button');
+
+if (toolbarOpenButton && detailFileForm) {
+	toolbarOpenButton.addEventListener('click', (event) => {
+		event.preventDefault();
+		if (typeof detailFileForm.requestSubmit === 'function') {
+			detailFileForm.requestSubmit();
+		} else {
+			const submitEvent = new Event('submit', { bubbles: true, cancelable: true });
+			detailFileForm.dispatchEvent(submitEvent);
+		}
+	});
+}
+
+if (navPrevButton) {
+	navPrevButton.addEventListener('click', (event) => {
+		event.preventDefault();
+		if (navPrevButton.disabled) {
+			return;
+		}
+		navigateToAdjacentProblem(-1);
+	});
+}
+
+if (navNextButton) {
+	navNextButton.addEventListener('click', (event) => {
+		event.preventDefault();
+		if (navNextButton.disabled) {
+			return;
+		}
+		navigateToAdjacentProblem(1);
+	});
+}
 
 function renderStatusChip(accepted) {
 	if (accepted === true) {
@@ -168,6 +207,92 @@ function collectMetadataEntries(problem) {
 	}
 
 	return entries;
+}
+
+function normalizeProblemId(value) {
+	if (value === null || value === undefined || value === '') {
+		return null;
+	}
+	const numeric = Number(value);
+	return Number.isFinite(numeric) ? numeric : null;
+}
+
+function findProblemIndexById(problemId) {
+	const numeric = normalizeProblemId(problemId);
+	if (numeric === null) {
+		return -1;
+	}
+	return state.problemset.findIndex((entry) => normalizeProblemId(entry.problem_id) === numeric);
+}
+
+function getAdjacentProblemId(offset) {
+	if (!Number.isInteger(offset) || offset === 0) {
+		return null;
+	}
+	const currentId = normalizeProblemId(state.currentProblemId);
+	if (currentId === null) {
+		return null;
+	}
+	const index = findProblemIndexById(currentId);
+	if (index === -1) {
+		return null;
+	}
+	const neighbor = state.problemset[index + offset];
+	if (!neighbor) {
+		return null;
+	}
+	return normalizeProblemId(neighbor.problem_id);
+}
+
+function syncProblemControls() {
+	const hasSelection = typeof state.currentProblemId === 'number' && Number.isFinite(state.currentProblemId);
+	if (problemToolbar) {
+		problemToolbar.classList.toggle('hidden', !hasSelection);
+	}
+	if (toolbarOpenButton) {
+		toolbarOpenButton.disabled = !hasSelection;
+	}
+	let prevId = null;
+	let nextId = null;
+	if (hasSelection) {
+		prevId = getAdjacentProblemId(-1);
+		nextId = getAdjacentProblemId(1);
+	}
+	if (problemNavigation) {
+		problemNavigation.classList.toggle('hidden', !hasSelection);
+	}
+	if (navPrevButton) {
+		const hasPrev = typeof prevId === 'number' && Number.isFinite(prevId);
+		navPrevButton.disabled = !hasPrev;
+		navPrevButton.dataset.targetId = hasPrev ? String(prevId) : '';
+		navPrevButton.title = hasPrev ? `跳转到题目 ${prevId}` : '没有上一题';
+	}
+	if (navNextButton) {
+		const hasNext = typeof nextId === 'number' && Number.isFinite(nextId);
+		navNextButton.disabled = !hasNext;
+		navNextButton.dataset.targetId = hasNext ? String(nextId) : '';
+		navNextButton.title = hasNext ? `跳转到题目 ${nextId}` : '没有下一题';
+	}
+}
+
+function updateSavedPasswordButton() {
+	if (!useSavedPasswordButton) {
+		return;
+	}
+	const hasSaved = Boolean(state.hasSavedPassword && state.savedUserId);
+	useSavedPasswordButton.classList.toggle('hidden', !hasSaved);
+	if (!hasSaved) {
+		useSavedPasswordButton.disabled = true;
+		useSavedPasswordButton.title = '暂无已保存的密码';
+		return;
+	}
+	useSavedPasswordButton.disabled = false;
+	useSavedPasswordButton.textContent = state.loggedIn ? '重新使用已保存的密码登录' : '使用已保存的密码登录';
+	useSavedPasswordButton.title = `使用已保存的密码登录账号 ${state.savedUserId}`;
+	const usernameField = loginForm.querySelector('input[name="username"]');
+	if (usernameField && !usernameField.value) {
+		usernameField.value = state.savedUserId;
+	}
 }
 
 function updateLoginSummary(text) {
@@ -351,6 +476,7 @@ function highlightProblemRow(problemId) {
 	selectedProblemRow = row;
 	row.classList.add('active');
 	problemActions.classList.remove('hidden');
+	syncProblemControls();
 	return true;
 }
 
@@ -371,6 +497,44 @@ function clearCurrentProblem({ notifyExtension = true } = {}) {
 	resetSubmissionState();
 	resetSampleTestUI();
 	updateSampleTestAvailability();
+	syncProblemControls();
+}
+
+function selectProblemById(problemId) {
+	const normalizedId = normalizeProblemId(problemId);
+	if (normalizedId === null) {
+		return false;
+	}
+	const row = problemsetBody.querySelector(`tr[data-problem-id="${normalizedId}"]`);
+	if (!row) {
+		return false;
+	}
+	state.pendingRestore = false;
+	state.currentProblemId = normalizedId;
+	resetSubmissionState();
+	if (!highlightProblemRow(normalizedId)) {
+		return false;
+	}
+	setStatus(fileStatus, '');
+	problemOutput.innerHTML = '<div class="placeholder">题目详情加载中…</div>';
+	vscode.postMessage({
+		type: 'selectProblem',
+		payload: { problemId: normalizedId },
+	});
+	vscode.postMessage({
+		type: 'fetchProblem',
+		payload: { problemId: normalizedId },
+	});
+	row.scrollIntoView({ block: 'nearest' });
+	return true;
+}
+
+function navigateToAdjacentProblem(offset) {
+	const targetId = getAdjacentProblemId(offset);
+	if (targetId === null) {
+		return;
+	}
+	selectProblemById(targetId);
 }
 
 function normalizeContent(value) {
@@ -597,6 +761,7 @@ function renderSubmissionState() {
 			const shouldNotify = previousId !== null;
 			clearCurrentProblem({ notifyExtension: shouldNotify });
 		}
+		syncProblemControls();
 	}
 
 	function escapeHtml(value) {
@@ -725,6 +890,7 @@ function renderSubmissionState() {
 		setStatus(fileStatus, '');
 		renderSubmissionState();
 		state.pendingRestore = false;
+		syncProblemControls();
 	}
 
 	function renderStatusTable(entries) {
@@ -767,6 +933,41 @@ function renderSubmissionState() {
 		});
 	});
 
+	if (useSavedPasswordButton) {
+		useSavedPasswordButton.addEventListener('click', (event) => {
+			event.preventDefault();
+			if (!state.hasSavedPassword || !state.savedUserId) {
+				setStatus(loginStatus, '未找到已保存的密码，请输入密码登录', true);
+				return;
+			}
+			const usernameField = loginForm.querySelector('input[name="username"]');
+			let username = state.savedUserId;
+			if (usernameField) {
+				const typed = usernameField.value.trim();
+				if (typed && (!state.savedUserId || typed === state.savedUserId)) {
+					username = typed;
+				} else {
+					usernameField.value = state.savedUserId;
+					username = state.savedUserId;
+				}
+			}
+			if (!username) {
+				setStatus(loginStatus, '请先填写用户名', true);
+				return;
+			}
+			const remember = rememberCheckbox ? rememberCheckbox.checked : true;
+			setStatus(loginStatus, '登录中…');
+			if (loginPanel) {
+				loginPanel.open = true;
+			}
+			updateLoginSummary('登录中…');
+			vscode.postMessage({
+				type: 'login',
+				payload: { username, password: '', remember, useSavedPassword: true },
+			});
+		});
+	}
+
 	problemsetForm.addEventListener('submit', (event) => {
 		event.preventDefault();
 		const formData = new FormData(problemsetForm);
@@ -794,20 +995,7 @@ function renderSubmissionState() {
 		if (!Number.isFinite(problemId)) {
 			return;
 		}
-		state.pendingRestore = false;
-		state.currentProblemId = problemId;
-		resetSubmissionState();
-		highlightProblemRow(problemId);
-		setStatus(fileStatus, '');
-		problemOutput.innerHTML = '<div class="placeholder">题目详情加载中…</div>';
-		vscode.postMessage({
-			type: 'selectProblem',
-			payload: { problemId },
-		});
-		vscode.postMessage({
-			type: 'fetchProblem',
-			payload: { problemId },
-		});
+		selectProblemById(problemId);
 	});
 
 	detailFileForm.addEventListener('submit', (event) => {
@@ -886,6 +1074,8 @@ function renderSubmissionState() {
 				state.loggedIn = true;
 				state.pendingRestore = false;
 				state.rememberPassword = message.rememberPassword !== false;
+				state.hasSavedPassword = Boolean(message.hasSavedPassword);
+				state.savedUserId = state.hasSavedPassword ? (message.userId ?? '') : '';
 				if (rememberCheckbox) {
 					rememberCheckbox.checked = state.rememberPassword;
 				}
@@ -897,6 +1087,7 @@ function renderSubmissionState() {
 				if (passwordField) {
 					passwordField.value = '';
 				}
+				updateSavedPasswordButton();
 				setStatus(loginStatus, `已登录为 ${message.userId}`);
 				collapseLoginPanel(message.userId, false);
 				clearCurrentProblem({ notifyExtension: false });
@@ -907,6 +1098,8 @@ function renderSubmissionState() {
 				const numericId = Number(message.currentProblemId);
 				state.currentProblemId = Number.isFinite(numericId) ? numericId : null;
 				state.rememberPassword = message.rememberPassword !== false;
+				state.hasSavedPassword = Boolean(message.hasSavedPassword);
+				state.savedUserId = state.hasSavedPassword ? (message.userId ?? '') : '';
 				if (rememberCheckbox) {
 					rememberCheckbox.checked = state.rememberPassword;
 				}
@@ -918,6 +1111,7 @@ function renderSubmissionState() {
 				if (restoredPasswordField) {
 					restoredPasswordField.value = '';
 				}
+				updateSavedPasswordButton();
 				const problemsetState = message.problemset ?? null;
 				const cachedProblem = message.lastProblem ?? null;
 				const cachedProblemValid = Boolean(
@@ -974,6 +1168,10 @@ function renderSubmissionState() {
 				if (state.currentProblemId !== null && state.submission.final) {
 					const finalCode = Number(state.submission.final.result_code);
 					if (Number.isFinite(finalCode) && finalCode === 4) {
+						vscode.postMessage({
+							type: 'updateProblemStatus',
+							payload: { problemId: state.currentProblemId, accepted: true },
+						});
 						updateProblemCompletion(state.currentProblemId, true);
 					}
 				}
@@ -994,6 +1192,8 @@ function renderSubmissionState() {
 			case 'savedCredentials':
 				state.loggedIn = false;
 				state.rememberPassword = message.rememberPassword !== false;
+				state.hasSavedPassword = Boolean(message.hasSavedPassword);
+				state.savedUserId = state.hasSavedPassword ? (message.userId ?? '') : '';
 				if (rememberCheckbox) {
 					rememberCheckbox.checked = state.rememberPassword;
 				}
@@ -1005,6 +1205,7 @@ function renderSubmissionState() {
 				if (savedPasswordField) {
 					savedPasswordField.value = '';
 				}
+				updateSavedPasswordButton();
 				setStatus(loginStatus, '自动登录未成功，请手动登录', true);
 				expandLoginPanel();
 				break;
@@ -1021,3 +1222,5 @@ function renderSubmissionState() {
 	resetSubmissionState();
 	resetSampleTestUI();
 	updateSampleTestAvailability();
+	updateSavedPasswordButton();
+	syncProblemControls();
