@@ -3,8 +3,9 @@ name: Build and Package VSIX
 on:
   push:
     branches: [ master ]
-  release:
-    types: [created]
+    tags:
+      - "v*"
+  workflow_dispatch:
 
 jobs:
   build-package:
@@ -32,3 +33,62 @@ jobs:
         with:
           name: vsix
           path: "*.vsix"
+
+  publish-release:
+    needs: build-package
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    steps:
+      - name: Download packaged VSIX
+        uses: actions/download-artifact@v4
+        with:
+          name: vsix
+          path: release
+
+      - name: Generate release notes
+        id: release_notes
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          result-encoding: string
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const currentTag = context.ref.replace('refs/tags/', '');
+
+            const tagsResponse = await github.rest.repos.listTags({ owner, repo, per_page: 100 });
+            const tags = tagsResponse.data || [];
+            const currentIndex = tags.findIndex(tag => tag.name === currentTag);
+            const previousTag = currentIndex >= 0 && currentIndex < tags.length - 1
+              ? tags[currentIndex + 1].name
+              : null;
+
+            const notesArgs = { owner, repo, tag_name: currentTag };
+            if (previousTag) {
+              notesArgs.previous_tag_name = previousTag;
+            }
+
+            let body = '';
+            try {
+              const generated = await github.rest.repos.generateReleaseNotes(notesArgs);
+              body = generated.data?.body || '';
+            } catch (error) {
+              core.warning(`Failed to generate release notes via API: ${error.message}`);
+            }
+
+            if (!body) {
+              body = `## What's Changed\n\n- Initial release notes for ${currentTag}`;
+              if (previousTag) {
+                body += `\n\n**Full Changelog**: https://github.com/${owner}/${repo}/compare/${previousTag}...${currentTag}`;
+              }
+            }
+
+            return body;
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: OJ Productivity Assistant ${{ github.ref_name }}
+          body: ${{ steps.release_notes.outputs.result }}
+          files: release/**/*.vsix
