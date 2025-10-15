@@ -25,7 +25,7 @@ jobs:
         run: npm run package
 
       - name: Package extension to VSIX
-        run: npx vsce package --yarn
+        run: npx @vscode/vsce package
 
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v4
