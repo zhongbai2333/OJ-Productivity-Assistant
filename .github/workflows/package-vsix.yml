@@ -54,33 +54,54 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const currentTag = context.ref.replace('refs/tags/', '');
+            const tag = context.ref.replace('refs/tags/', '');
 
-            const tagsResponse = await github.rest.repos.listTags({ owner, repo, per_page: 100 });
-            const tags = tagsResponse.data || [];
-            const currentIndex = tags.findIndex(tag => tag.name === currentTag);
-            const previousTag = currentIndex >= 0 && currentIndex < tags.length - 1
-              ? tags[currentIndex + 1].name
-              : null;
+            const releasesResp = await github.rest.repos.listReleases({ owner, repo, per_page: 100 });
+            const releases = releasesResp.data || [];
+            const tags = releases.map((release) => release.tag_name);
+            const idx = tags.indexOf(tag);
+            const prevRelease = idx >= 0 && idx < releases.length - 1 ? releases[idx + 1] : null;
+            const since = prevRelease ? prevRelease.published_at : null;
+            const prevTag = prevRelease ? prevRelease.tag_name : null;
+            const compareUrl = prevTag ? `https://github.com/${owner}/${repo}/compare/${prevTag}...${tag}` : '';
 
-            const notesArgs = { owner, repo, tag_name: currentTag };
-            if (previousTag) {
-              notesArgs.previous_tag_name = previousTag;
+            const params = { owner, repo, state: 'closed', per_page: 100 };
+            if (since) {
+              params.since = since;
             }
 
-            let body = '';
-            try {
-              const generated = await github.rest.repos.generateReleaseNotes(notesArgs);
-              body = generated.data?.body || '';
-            } catch (error) {
-              core.warning(`Failed to generate release notes via API: ${error.message}`);
-            }
+            const issuesResp = await github.rest.issues.listForRepo(params);
+            const items = (issuesResp.data || []).filter((item) =>
+              !(item.labels || []).some((lbl) => ['wontfix', 'duplicate'].includes(lbl.name?.toLowerCase() ?? ''))
+            );
 
-            if (!body) {
-              body = `## What's Changed\n\n- Initial release notes for ${currentTag}`;
-              if (previousTag) {
-                body += `\n\n**Full Changelog**: https://github.com/${owner}/${repo}/compare/${previousTag}...${currentTag}`;
+            const groups = { Fix: [], Update: [], Feature: [] };
+            for (const item of items) {
+              for (const lbl of item.labels || []) {
+                if (lbl.name === 'bug') {
+                  groups.Fix.push(item);
+                } else if (lbl.name === 'update') {
+                  groups.Update.push(item);
+                } else if (lbl.name === 'enhancement') {
+                  groups.Feature.push(item);
+                }
               }
+            }
+
+            const zh = { Fix: '修复', Update: '更新', Feature: '新增' };
+            let body = "# What's Changed\n\n";
+            for (const key of ['Fix', 'Update', 'Feature']) {
+              if (groups[key].length) {
+                body += `## ${key}\n\n`;
+                for (const item of groups[key]) {
+                  body += `- ${zh[key]}：[#${item.number}](${item.html_url}) ${item.title}\n`;
+                }
+                body += "\n";
+              }
+            }
+
+            if (compareUrl) {
+              body += `**Full Changelog**: ${compareUrl}\n`;
             }
 
             return body;
