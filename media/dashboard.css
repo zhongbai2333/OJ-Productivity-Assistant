@@ -393,6 +393,16 @@ th.placeholder {
 	margin-top: 8px;
 }
 
+.external-warning {
+	margin-bottom: 12px;
+	padding: 8px 12px;
+	border-radius: 6px;
+	border: 1px solid rgba(255, 215, 0, 0.4);
+	background: rgba(255, 215, 0, 0.1);
+	color: #ffeb3b;
+	font-size: 0.9rem;
+}
+
 .action-block {
 	display: flex;
 	flex-direction: column;

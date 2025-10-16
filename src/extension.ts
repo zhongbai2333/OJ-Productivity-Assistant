@@ -1,4 +1,6 @@
 import * as crypto from 'crypto';
+import { promises as fs } from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import * as vscode from 'vscode';
@@ -23,6 +25,7 @@ interface PersistedSession {
     currentProblemId?: number;
     problemset?: PersistedProblemsetState;
     lastProblem?: PersistedProblemState;
+    preferredLanguage?: string;
 }
 
 interface SessionState {
@@ -39,7 +42,8 @@ type WebviewMessage =
     | { type: 'submitSolution'; payload: { problemId: number; language: string; filePath: string; contestProblemId?: number | null } }
     | { type: 'selectProblem'; payload: { problemId: number | null } }
     | { type: 'runSampleTest'; payload: { problemId: number | null; language: string; filePath: string; sampleInput: string; expectedOutput?: string | null } }
-    | { type: 'updateProblemStatus'; payload: { problemId: number; accepted: boolean } };
+    | { type: 'updateProblemStatus'; payload: { problemId: number; accepted: boolean } }
+    | { type: 'setPreferredLanguage'; payload: { language: string } };
 
 export function activate(context: vscode.ExtensionContext) {
     const provider = new OJAssistantProvider(context);
@@ -67,6 +71,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
     private readonly stateDirName = '.oj-assistant';
     private readonly stateFileName = 'session.json';
     private warnedMissingWorkspace = false;
+    private preferredLanguage = 'python';
 
     public constructor(private readonly context: vscode.ExtensionContext) {
         this.python = new PythonService(context);
@@ -137,6 +142,9 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                         message.payload.expectedOutput ?? undefined,
                     );
                     break;
+                case 'setPreferredLanguage':
+                    await this.persistPreferredLanguage(message.payload.language);
+                    break;
                 case 'updateProblemStatus':
                     await this.handleUpdateProblemStatus(message.payload.problemId, message.payload.accepted);
                     break;
@@ -189,6 +197,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
             userId: trimmedUsername,
             rememberPassword: remember,
             hasSavedPassword: this.hasSavedPassword(),
+            preferredLanguage: this.preferredLanguage,
         });
     }
 
@@ -261,8 +270,15 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         await this.ensureDirectory(folderUri);
 
         const extension = this.getExtensionForLanguage(language);
-        const fileName = `problem_${problemId}.${extension}`;
-        const fileUri = vscode.Uri.joinPath(folderUri, fileName);
+        let fileUri: vscode.Uri;
+        if (language === 'java') {
+            const problemFolder = vscode.Uri.joinPath(folderUri, `problem_${problemId}`);
+            await this.ensureDirectory(problemFolder);
+            fileUri = vscode.Uri.joinPath(problemFolder, 'Main.java');
+        } else {
+            const fileName = `problem_${problemId}.${extension}`;
+            fileUri = vscode.Uri.joinPath(folderUri, fileName);
+        }
 
         const exists = await this.fileExists(fileUri);
         if (!exists) {
@@ -273,8 +289,9 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         const document = await vscode.workspace.openTextDocument(fileUri);
         await vscode.window.showTextDocument(document);
 
-        const relativePath = vscode.workspace.asRelativePath(fileUri);
-        this.postMessage({ type: 'fileCreated', path: relativePath });
+    const relativePath = vscode.workspace.asRelativePath(fileUri);
+    this.postMessage({ type: 'fileCreated', path: relativePath });
+    await this.persistPreferredLanguage(language);
     }
 
     private async handleSubmitSolution(problemId: number, language: string, filePath: string, contestProblemId?: number): Promise<void> {
@@ -396,6 +413,8 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         switch (language) {
             case 'python':
                 return this.runPythonSample(filePath, sampleInput, expectedOutput);
+            case 'java':
+                return this.runJavaSample(filePath, sampleInput, expectedOutput);
             default:
                 throw new Error(`暂未支持 ${language} 语言的快速测试`);
         }
@@ -417,6 +436,96 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
             exitCode: result.exitCode,
             matched,
         };
+    }
+
+    private async runJavaSample(
+        filePath: string,
+        sampleInput: string,
+        expectedOutput?: string,
+    ): Promise<{ stdout: string; stderr: string; exitCode: number | null; matched?: boolean }> {
+        const { java, javac } = this.getJavaExecutables();
+        const entryPoint = await this.detectJavaEntryPoint(filePath);
+        const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oj-assistant-java-'));
+        try {
+            const compileArgs = ['-encoding', 'UTF-8', '-d', tempDir, filePath];
+            const compileResult = await this.runProcess(javac, compileArgs, '', path.dirname(filePath));
+            if (compileResult.exitCode !== 0) {
+                const message = (compileResult.stderr || compileResult.stdout || '').trim() || '未知的编译错误';
+                throw new Error(`Java 编译失败：\n${message}`);
+            }
+
+            const className = entryPoint.packageName ? `${entryPoint.packageName}.${entryPoint.mainClass}` : entryPoint.mainClass;
+            const runArgs = ['-cp', tempDir, className];
+            const runResult = await this.runProcess(java, runArgs, sampleInput, path.dirname(filePath));
+            const normalizedStdout = this.normalizeProgramOutput(runResult.stdout);
+            const normalizedExpected = expectedOutput === undefined ? undefined : this.normalizeProgramOutput(expectedOutput);
+            const matched = normalizedExpected !== undefined ? normalizedStdout === normalizedExpected : undefined;
+            return {
+                stdout: runResult.stdout,
+                stderr: runResult.stderr,
+                exitCode: runResult.exitCode,
+                matched,
+            };
+        } finally {
+            try {
+                await fs.rm(tempDir, { recursive: true, force: true });
+            } catch {
+                // ignore cleanup failures
+            }
+        }
+    }
+
+    private async detectJavaEntryPoint(filePath: string): Promise<{ mainClass: string; packageName: string | null }> {
+        const content = await fs.readFile(filePath, 'utf8');
+        const packageMatch = content.match(/^[\s\uFEFF\u200B]*package\s+([A-Za-z0-9_.]+)\s*;/m);
+        const classMatch = content.match(/public\s+class\s+([A-Za-z0-9_]+)/);
+        if (!classMatch) {
+            throw new Error('无法识别 Java 主类，请确保存在 public class 定义');
+        }
+        const hasMainMethod = /public\s+static\s+void\s+main\s*\(/.test(content);
+        if (!hasMainMethod) {
+            throw new Error('未找到 public static void main(String[] args) 入口方法');
+        }
+        return {
+            mainClass: classMatch[1],
+            packageName: packageMatch ? packageMatch[1] : null,
+        };
+    }
+
+    private getJavaExecutables(): { java: string; javac: string } {
+        const config = vscode.workspace.getConfiguration('ojAssistant');
+        const configuredJava = config.get<string>('javaPath')?.trim();
+        const configuredJavac = config.get<string>('javacPath')?.trim();
+        const suffix = process.platform === 'win32' ? '.exe' : '';
+        const fromHome = (home: string | undefined, binary: string) =>
+            home ? path.join(home, 'bin', `${binary}${suffix}`) : undefined;
+
+        const pickFirst = (candidates: Array<string | undefined>): string => {
+            for (const candidate of candidates) {
+                if (candidate && candidate.trim()) {
+                    return candidate;
+                }
+            }
+            return '';
+        };
+
+        const javaBinary = pickFirst([
+            configuredJava,
+            fromHome(process.env.JAVA_HOME, 'java'),
+            fromHome(process.env.JDK_HOME, 'java'),
+            suffix ? `java${suffix}` : undefined,
+            'java',
+        ]) || 'java';
+
+        const javacBinary = pickFirst([
+            configuredJavac,
+            fromHome(process.env.JAVA_HOME, 'javac'),
+            fromHome(process.env.JDK_HOME, 'javac'),
+            suffix ? `javac${suffix}` : undefined,
+            'javac',
+        ]) || 'javac';
+
+        return { java: javaBinary, javac: javacBinary };
     }
 
     private async runProcess(
@@ -460,6 +569,14 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
 
     private normalizeProgramOutput(value: string): string {
         return value.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trimEnd();
+    }
+
+    private async persistPreferredLanguage(language: string): Promise<void> {
+        const normalized = this.normalizeLanguage(language);
+        this.preferredLanguage = normalized;
+        await this.mutatePersistedSession((persisted) => {
+            persisted.preferredLanguage = normalized;
+        });
     }
 
     private postMessage(message: Record<string, unknown>): void {
@@ -602,6 +719,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 savedAt: Date.now(),
                 userId: this.savedCredentials?.userId ?? this.session?.userId ?? '',
                 rememberPassword: this.savedCredentials?.rememberPassword ?? false,
+                preferredLanguage: this.preferredLanguage,
             };
             if (persisted.rememberPassword && this.savedCredentials?.passwordHash) {
                 persisted.passwordHash = this.savedCredentials.passwordHash;
@@ -725,6 +843,9 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         if (!persisted) {
             return;
         }
+        if (persisted.preferredLanguage) {
+            this.preferredLanguage = this.normalizeLanguage(persisted.preferredLanguage);
+        }
         const rememberPassword = Boolean(persisted.rememberPassword);
         const passwordHash = rememberPassword ? persisted.passwordHash : undefined;
         this.savedCredentials = {
@@ -749,6 +870,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                     problemset: cachedProblemset,
                     lastProblem: cachedProblem,
                     hasSavedPassword: this.hasSavedPassword(),
+                    preferredLanguage: this.preferredLanguage,
                 });
                 return;
             }
@@ -759,6 +881,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
             userId: persisted.userId,
             rememberPassword,
             hasSavedPassword: this.hasSavedPassword(),
+            preferredLanguage: this.preferredLanguage,
         });
     }
 
@@ -772,7 +895,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
 <html lang="zh-cn">
 <head>
     <meta charset="UTF-8">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src https: http: data: ${webview.cspSource};">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="${styleUri}">
     <title>OJ Productivity Assistant</title>
@@ -955,17 +1078,92 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private getTemplateForLanguage(language: string, problemId: number): string {
-        const header = `# Problem ${problemId}\n\n`;
+    private normalizeLanguage(language: string): string {
         switch (language) {
             case 'python':
-                return `${header}def solve():\n\tpass\n\nif __name__ == "__main__":\n\ttry:\n\t\tsolve()\n\texcept Exception as exc:\n\t\tprint(exc)\n`;
             case 'cpp':
-                return `${header}#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n\tios::sync_with_stdio(false);\n\tcin.tie(nullptr);\n\treturn 0;\n}\n`;
             case 'java':
-                return `${header}import java.io.BufferedReader;\nimport java.io.IOException;\nimport java.io.InputStreamReader;\nimport java.util.StringTokenizer;\n\npublic class Main {\n\tpublic static void main(String[] args) throws Exception {\n\t\ttry (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in))) {\n\t\t\tStringTokenizer tokenizer = new StringTokenizer(reader.readLine());\n\t\t}\n\t}\n}\n`;
+                return language;
             default:
-                return header;
+                return 'python';
+        }
+    }
+
+    private getTemplateForLanguage(language: string, problemId: number): string {
+        const newline = '\n';
+        const indentUnit = this.getIndentUnit(language);
+        const indent = (level: number) => indentUnit.repeat(level);
+        const header = this.getHeaderForLanguage(language, problemId);
+
+        switch (language) {
+            case 'python':
+                return [
+                    header,
+                    'def solve():',
+                    `${indent(1)}pass`,
+                    '',
+                    'if __name__ == "__main__":',
+                    `${indent(1)}solve()`,
+                    '',
+                ].join(newline);
+            case 'cpp':
+                return [
+                    header,
+                    '#include <bits/stdc++.h>',
+                    'using namespace std;',
+                    '',
+                    'int main() {',
+                    `${indent(1)}ios::sync_with_stdio(false);`,
+                    `${indent(1)}cin.tie(nullptr);`,
+                    '',
+                    `${indent(1)}return 0;`,
+                    '}',
+                    '',
+                ].join(newline);
+            case 'java':
+                return [
+                    header,
+                    'public class Main {',
+                    `${indent(1)}public static void main(String[] args) throws Exception {`,
+                    `${indent(1)}}`,
+                    '}',
+                    '',
+                ].join(newline);
+            default:
+                return `${header}${newline}`;
+        }
+    }
+
+    private getHeaderForLanguage(language: string, problemId: number): string {
+        const prefix = language === 'python' ? '#' : '//';
+        return `${prefix} Problem ${problemId}`;
+    }
+
+    private getIndentUnit(language: string): string {
+        const languageId = this.mapLanguageToEditorId(language);
+        const scope = languageId ? { languageId } : undefined;
+        const editorConfig = vscode.workspace.getConfiguration('editor', scope);
+        const insertSpaces = editorConfig.get<boolean>('insertSpaces');
+        const tabSizeSetting = editorConfig.get<string | number>('tabSize');
+        let tabSize = typeof tabSizeSetting === 'number' ? tabSizeSetting : Number.parseInt(`${tabSizeSetting ?? ''}`, 10);
+        if (!Number.isFinite(tabSize) || tabSize <= 0) {
+            tabSize = 4;
+        }
+        const useSpaces = insertSpaces ?? true;
+        const normalizedTabSize = Math.max(1, Math.trunc(tabSize));
+        return useSpaces ? ' '.repeat(normalizedTabSize) : '\t';
+    }
+
+    private mapLanguageToEditorId(language: string): string | undefined {
+        switch (language) {
+            case 'python':
+                return 'python';
+            case 'cpp':
+                return 'cpp';
+            case 'java':
+                return 'java';
+            default:
+                return undefined;
         }
     }
 

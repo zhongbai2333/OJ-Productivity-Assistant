@@ -1,5 +1,7 @@
+import base64
 import hashlib
 import json
+import mimetypes
 import re
 import sys
 import time
@@ -9,7 +11,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import bs4
 import requests
 import urllib3
-from bs4.element import Tag
+from bs4.element import NavigableString, Tag
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -48,13 +50,78 @@ JUDGE_STATUS = {
 
 AUTH_REQUIRED_ERROR = "AUTH_REQUIRED"
 
+MAX_EMBED_IMAGE_SIZE = 2 * 1024 * 1024  # 约 2 MiB，避免过大的内嵌图片
+_IMAGE_DATA_CACHE: Dict[str, Optional[str]] = {}
+
+ALLOWED_RICH_TAGS: Set[str] = {
+    "p",
+    "br",
+    "img",
+    "strong",
+    "em",
+    "b",
+    "i",
+    "u",
+    "ul",
+    "ol",
+    "li",
+    "table",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "th",
+    "td",
+    "pre",
+    "code",
+    "blockquote",
+    "sup",
+    "sub",
+    "a",
+    "hr",
+    "div",
+    "span",
+}
+
+ALLOWED_RICH_ATTRS: Dict[str, Set[str]] = {
+    "img": {"src", "alt", "title"},
+    "a": {"href", "title", "target", "rel"},
+    "table": {"border"},
+    "th": {"colspan", "rowspan", "scope"},
+    "td": {"colspan", "rowspan", "scope"},
+    "tr": set(),
+    "code": set(),
+    "pre": set(),
+    "p": set(),
+    "div": set(),
+    "span": set(),
+    "ul": set(),
+    "ol": set(),
+    "li": set(),
+    "strong": set(),
+    "em": set(),
+    "b": set(),
+    "i": set(),
+    "u": set(),
+    "blockquote": set(),
+    "sup": set(),
+    "sub": set(),
+    "hr": set(),
+    "thead": set(),
+    "tbody": set(),
+    "tfoot": set(),
+}
+
 
 def _normalize_newlines(value: str) -> str:
     return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _normalize_paragraph(value: str) -> str:
-    text = _normalize_newlines(value).replace("\xa0", " ")
+    text = _normalize_newlines(value)
+    if "<img" in text:
+        return text
+    text = text.replace("\xa0", " ")
     raw_lines = [line.replace("\xa0", " ") for line in text.split("\n")]
     normalized: List[str] = []
     blank_pending = False
@@ -76,7 +143,7 @@ def _normalize_sample(value: str) -> str:
     lines = [line.rstrip().replace("\xa0", " ") for line in text.split("\n")]
     normalized: List[str] = []
     blank_pending = False
-    for line in lines:
+    for line in lines: 
         if line:
             normalized.append(line)
             blank_pending = False
@@ -293,10 +360,153 @@ def _collect_sections(soup: bs4.BeautifulSoup) -> Dict[str, str]:
         if segment is None:
             continue
 
-        text = segment.get_text("\n", strip=False)
-        sections[title] = text
+        html = segment.decode_contents()
+        sections[title] = html
 
     return sections
+
+
+def _absolutize_resources(soup: bs4.BeautifulSoup, base_url: str) -> None:
+    for tag in soup.find_all("img"):
+        src = tag.get("src")
+        data_src = tag.get("data-src")
+        candidate = src or data_src
+        if not candidate:
+            continue
+        absolute = urljoin(base_url, candidate)
+        if src != absolute:
+            tag["src"] = absolute
+        if data_src:
+            tag["data-src"] = urljoin(base_url, data_src)
+
+
+def _guess_mime_type(url: str, content_type: Optional[str]) -> Optional[str]:
+    if content_type:
+        mime = content_type.split(";", 1)[0].strip()
+        if mime:
+            return mime
+    guessed, _ = mimetypes.guess_type(url)
+    return guessed
+
+
+def _fetch_image_as_data_url(session: requests.Session, url: str) -> Optional[str]:
+    cached = _IMAGE_DATA_CACHE.get(url)
+    if cached is not None:
+        return cached
+    try:
+        response = session.get(url, timeout=10)
+        response.raise_for_status()
+        content = response.content
+    except requests.RequestException:
+        _IMAGE_DATA_CACHE[url] = None
+        return None
+    if not content or len(content) > MAX_EMBED_IMAGE_SIZE:
+        _IMAGE_DATA_CACHE[url] = None
+        return None
+    mime_type = _guess_mime_type(url, response.headers.get("content-type")) or "application/octet-stream"
+    if not mime_type.startswith("image/"):
+        _IMAGE_DATA_CACHE[url] = None
+        return None
+    encoded = base64.b64encode(content).decode("ascii")
+    data_url = f"data:{mime_type};base64,{encoded}"
+    _IMAGE_DATA_CACHE[url] = data_url
+    return data_url
+
+
+def _embed_protected_images(soup: bs4.BeautifulSoup, session: requests.Session, base_url: str) -> None:
+    for tag in soup.find_all("img"):
+        src = tag.get("src")
+        if not src:
+            continue
+        if src.startswith("data:"):
+            continue
+        absolute = urljoin(base_url, src)
+        embedded = _fetch_image_as_data_url(session, absolute)
+        if embedded:
+            tag["src"] = embedded
+            for attr in ("data-src", "srcset", "data-original", "data-lazy-src"):
+                if attr in tag.attrs:
+                    del tag[attr]
+
+
+def _sanitize_rich_content(html: str) -> str:
+    fragment = bs4.BeautifulSoup(html, "html.parser")
+
+    for garbage in fragment.find_all(["script", "style"]):
+        garbage.decompose()
+
+    for tag in fragment.find_all(True):
+        name = tag.name.lower()
+        if name == "font":
+            tag.unwrap()
+            continue
+        if name not in ALLOWED_RICH_TAGS:
+            tag.unwrap()
+            continue
+        allowed_attrs = ALLOWED_RICH_ATTRS.get(name, set())
+        for attr in list(tag.attrs.keys()):
+            if attr not in allowed_attrs:
+                del tag.attrs[attr]
+        if name == "img" and not tag.get("src"):
+            tag.decompose()
+        if name == "span" and not tag.attrs:
+            tag.unwrap()
+
+    for div in fragment.find_all("div"):
+        if div.attrs:
+            div.attrs = {}
+        if not div.find(["div", "table", "ul", "ol", "pre", "blockquote"]):
+            div.name = "p"
+
+    for text_node in fragment.find_all(string=True):
+        if isinstance(text_node, NavigableString):
+            new_text = text_node.replace("\xa0", " ")
+            if new_text != text_node:
+                text_node.replace_with(new_text)
+
+    for tag in fragment.find_all("p"):
+        has_image = tag.find("img") is not None
+        if not tag.get_text(strip=True) and not has_image:
+            tag.decompose()
+            continue
+        if has_image:
+            meaningful_children = []
+            for child in list(tag.children):
+                if isinstance(child, NavigableString) and not child.strip():
+                    child.extract()
+                    continue
+                meaningful_children.append(child)
+            if meaningful_children and all(getattr(child, "name", None) == "img" for child in meaningful_children):
+                tag.unwrap()
+
+    for br in fragment.find_all("br"):
+        sibling = br.next_sibling
+        while isinstance(sibling, Tag) and sibling.name == "br":
+            next_sibling = sibling.next_sibling
+            sibling.decompose()
+            sibling = next_sibling
+
+    for br in list(fragment.find_all("br")):
+        prev_text = br.previous_sibling
+        while isinstance(prev_text, NavigableString) and not prev_text.strip():
+            prev_text = prev_text.previous_sibling
+        next_text = br.next_sibling
+        while isinstance(next_text, NavigableString) and not next_text.strip():
+            next_text = next_text.next_sibling
+        if prev_text is None or (isinstance(prev_text, Tag) and prev_text.name in {"section", "div", "p"} and not prev_text.get_text(strip=True)):
+            br.decompose()
+        elif next_text is None or (isinstance(next_text, Tag) and next_text.name in {"section", "div", "p"} and not next_text.get_text(strip=True)):
+            br.decompose()
+
+    for span in fragment.find_all("span"):
+        if not span.attrs:
+            span.unwrap()
+
+    body = fragment.body or fragment
+    sanitized = body.decode_contents()
+    sanitized = re.sub(r"(?:\s*<br\s*/?>\s*){3,}", "<br /><br />", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
+    return sanitized.strip()
 
 
 def _extract_problem_header(soup: bs4.BeautifulSoup) -> Dict[str, Optional[str]]:
@@ -317,6 +527,8 @@ def fetch_problem(session, problem_id):
     response.raise_for_status()
 
     soup = bs4.BeautifulSoup(response.text, "html.parser")
+    _absolutize_resources(soup, problem_url)
+    _embed_protected_images(soup, session, problem_url)
 
     header_info = _extract_problem_header(soup)
     metadata = _collect_labels(soup)
@@ -334,9 +546,30 @@ def fetch_problem(session, problem_id):
     def _clean_value(key: str, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
+        html = value
+        fragment = bs4.BeautifulSoup(html, "html.parser")
+        text_content = fragment.get_text("\n", strip=False)
         if key in {"sample_input", "sample_output"}:
-            return _normalize_sample(value)
-        return _normalize_paragraph(value)
+            return _normalize_sample(text_content)
+        normalized = _normalize_paragraph(text_content)
+        html_lower = html.lower()
+        if any(marker in html_lower for marker in ("<img", "<table", "<iframe")):
+            return _sanitize_rich_content(html)
+        return normalized
+
+    raw_sections: Dict[str, str] = {}
+    for title, value in sections.items():
+        if value is None:
+            continue
+        fragment = bs4.BeautifulSoup(value, "html.parser")
+        plain_text = fragment.get_text("\n", strip=False)
+        html_lower = value.lower()
+        if any(marker in html_lower for marker in ("<img", "<table", "<iframe")):
+            raw_sections[title] = _sanitize_rich_content(value)
+        else:
+            raw_sections[title] = _normalize_paragraph(plain_text)
+
+    has_external_resources = any("<img" in value.lower() for value in sections.values() if value)
 
     problem_data = {
         "problem_id": header_info.get("problem_id") or str(problem_id),
@@ -350,8 +583,9 @@ def fetch_problem(session, problem_id):
         "hint": _clean_value("hint", _get_section_value("hint")),
         "source": _clean_value("source", _get_section_value("source")),
         "tags": tags,
-        "raw_sections": {title: _normalize_paragraph(value) for title, value in sections.items()},
+        "raw_sections": raw_sections,
         "url": problem_url,
+        "hasExternalResources": has_external_resources,
     }
 
     return problem_data

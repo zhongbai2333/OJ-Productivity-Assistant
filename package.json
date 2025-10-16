@@ -46,6 +46,16 @@
                     "default": "python",
                     "description": "Python 解释器命令或绝对路径，用于运行登录与提交脚本。"
                 },
+                "ojAssistant.javaPath": {
+                    "type": "string",
+                    "default": "java",
+                    "description": "Java 运行时命令或绝对路径，用于快速测试 Java 程序。"
+                },
+                "ojAssistant.javacPath": {
+                    "type": "string",
+                    "default": "javac",
+                    "description": "javac 编译器命令或绝对路径，用于快速测试 Java 程序。"
+                },
                 "ojAssistant.codeDirectory": {
                     "type": "string",
                     "default": "oj-workspace",

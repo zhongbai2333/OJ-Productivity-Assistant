@@ -6,6 +6,7 @@ const LANGUAGES = [
 	{ id: 'cpp', label: 'C++ (语言代码 1)' },
 	{ id: 'java', label: 'Java (语言代码 3)' },
 ];
+const LANGUAGE_ID_SET = new Set(LANGUAGES.map((entry) => entry.id));
 
 const METADATA_LABEL_ALIASES = {
 	'来源/分类': '来源/分类',
@@ -31,6 +32,7 @@ const state = {
 		input: '',
 		output: '',
 	},
+	preferredLanguage: LANGUAGES[0].id,
 	submission: {
 		initial: null,
 		final: null,
@@ -69,6 +71,12 @@ const toolbarOpenButton = document.getElementById('toolbar-open-file');
 const problemNavigation = document.getElementById('problem-navigation');
 const navPrevButton = document.getElementById('nav-prev-button');
 const navNextButton = document.getElementById('nav-next-button');
+
+if (languageSelect) {
+	languageSelect.addEventListener('change', () => {
+		setPreferredLanguage(String(languageSelect.value), { notifyExtension: true });
+	});
+}
 
 if (toolbarOpenButton && detailFileForm) {
 	toolbarOpenButton.addEventListener('click', (event) => {
@@ -322,6 +330,22 @@ function expandLoginPanel() {
 	}
 }
 
+function setPreferredLanguage(value, options = {}) {
+	const fallback = LANGUAGES[0]?.id ?? 'python';
+	const normalized = LANGUAGE_ID_SET.has(value) ? value : fallback;
+	const changed = normalized !== state.preferredLanguage;
+	state.preferredLanguage = normalized;
+	if (languageSelect && languageSelect.value !== normalized) {
+		languageSelect.value = normalized;
+	}
+	if (options.notifyExtension && changed) {
+		vscode.postMessage({
+			type: 'setPreferredLanguage',
+			payload: { language: normalized },
+		});
+	}
+}
+
 function populateLanguages() {
 	for (const option of LANGUAGES) {
 		const one = document.createElement('option');
@@ -329,7 +353,7 @@ function populateLanguages() {
 		one.textContent = option.label;
 		languageSelect.appendChild(one);
 	}
-	languageSelect.value = LANGUAGES[0].id;
+	setPreferredLanguage(state.preferredLanguage);
 }
 
 function setStatus(target, message, isError = false) {
@@ -390,7 +414,7 @@ function triggerSampleTest() {
 		type: 'runSampleTest',
 		payload: {
 			problemId: state.currentProblemId,
-			language: String(languageSelect.value),
+			language: state.preferredLanguage,
 			filePath,
 			sampleInput: state.samples.input,
 			expectedOutput: state.samples.output || null,
@@ -773,11 +797,151 @@ function renderSubmissionState() {
 			.replace(/'/g, '&#39;');
 	}
 
+	const SANITIZE_ALLOWED_TAGS = new Set([
+		'a',
+		'b',
+		'blockquote',
+		'br',
+		'code',
+		'em',
+		'h1',
+		'h2',
+		'h3',
+		'h4',
+		'h5',
+		'h6',
+		'hr',
+		'i',
+		'img',
+		'li',
+		'ol',
+		'p',
+		'pre',
+		'span',
+		'strong',
+		'sub',
+		'sup',
+		'table',
+		'tbody',
+		'td',
+		'tfoot',
+		'th',
+		'thead',
+		'ul',
+		'tr',
+		'div',
+	]);
+
+	const SANITIZE_GLOBAL_ATTRIBUTES = new Set(['class']);
+
+	const SANITIZE_TAG_ATTRIBUTES = {
+		a: ['href', 'title', 'target', 'rel'],
+		img: ['src', 'alt', 'title', 'width', 'height'],
+		table: ['border', 'cellpadding', 'cellspacing'],
+		td: ['colspan', 'rowspan'],
+		th: ['colspan', 'rowspan'],
+	};
+
+	function isSafeUrl(value, { allowDataImage } = { allowDataImage: false }) {
+		if (!value) {
+			return false;
+		}
+		const trimmed = String(value).trim();
+		if (!trimmed) {
+			return false;
+		}
+		const lower = trimmed.toLowerCase();
+		if (lower.startsWith('javascript:') || lower.startsWith('vbscript:')) {
+			return false;
+		}
+		if (lower.startsWith('data:')) {
+			return allowDataImage && /^data:image\//iu.test(lower);
+		}
+		return /^(https?:|vscode-resource:|vscode-file:|\/)/iu.test(trimmed);
+	}
+
+	function unwrapElement(element) {
+		const parent = element.parentNode;
+		if (!parent) {
+			element.remove();
+			return;
+		}
+		for (const child of Array.from(element.childNodes)) {
+			parent.insertBefore(child, element);
+		}
+		parent.removeChild(element);
+	}
+
+	function sanitizeHtml(input) {
+		if (!input) {
+			return '';
+		}
+		const parser = new DOMParser();
+		const documentWrapper = parser.parseFromString(`<div>${input}</div>`, 'text/html');
+		const container = documentWrapper.body.firstElementChild;
+		if (!container) {
+			return '';
+		}
+
+		const sanitizeNode = (node) => {
+			for (const child of Array.from(node.childNodes)) {
+				if (child.nodeType === Node.ELEMENT_NODE) {
+					const tag = child.tagName.toLowerCase();
+					if (!SANITIZE_ALLOWED_TAGS.has(tag)) {
+						unwrapElement(child);
+						sanitizeNode(node);
+						return;
+					}
+					const allowedAttributes = new Set([
+						...SANITIZE_GLOBAL_ATTRIBUTES,
+						...(SANITIZE_TAG_ATTRIBUTES[tag] ?? []),
+					]);
+					for (const attribute of Array.from(child.attributes)) {
+						const name = attribute.name.toLowerCase();
+						if (!allowedAttributes.has(name)) {
+							child.removeAttribute(attribute.name);
+							continue;
+						}
+						const value = attribute.value;
+						if (name === 'href' && !isSafeUrl(value, { allowDataImage: false })) {
+							child.removeAttribute(attribute.name);
+							continue;
+						}
+						if (name === 'src' && !isSafeUrl(value, { allowDataImage: tag === 'img' })) {
+							child.removeAttribute(attribute.name);
+							continue;
+						}
+						if (name === 'target') {
+							child.setAttribute('target', '_blank');
+							const rel = child.getAttribute('rel') ?? '';
+							const tokens = new Set(rel.split(/\s+/u).filter(Boolean));
+							tokens.add('noopener');
+							tokens.add('noreferrer');
+							child.setAttribute('rel', Array.from(tokens).join(' '));
+						}
+					}
+					sanitizeNode(child);
+				} else if (child.nodeType === Node.TEXT_NODE) {
+					continue;
+				} else {
+					child.remove();
+				}
+			}
+		};
+
+		sanitizeNode(container);
+		return container.innerHTML;
+	}
+
 	function formatParagraph(value) {
 		if (!value) {
 			return '';
 		}
-		const escaped = escapeHtml(String(value)).replace(/\n/g, '<br />');
+		const raw = String(value);
+		if (/<\/?[a-z][\s\S]*>/iu.test(raw)) {
+			return sanitizeHtml(raw);
+		}
+		const escaped = escapeHtml(raw).replace(/\n/g, '<br />');
 		return `<p>${escaped}</p>`;
 	}
 
@@ -803,7 +967,11 @@ function renderSubmissionState() {
 				return;
 			}
 			seenContent.add(signature);
-			sections.push({ title, content: formatter(String(rawValue)) });
+			const formatted = formatter(String(rawValue));
+			if (!formatted || !formatted.trim()) {
+				return;
+			}
+			sections.push({ title, content: formatted });
 		};
 
 		pushSection('题目描述', problem.description);
@@ -1088,6 +1256,9 @@ function renderSubmissionState() {
 					passwordField.value = '';
 				}
 				updateSavedPasswordButton();
+				if ('preferredLanguage' in message) {
+					setPreferredLanguage(message.preferredLanguage);
+				}
 				setStatus(loginStatus, `已登录为 ${message.userId}`);
 				collapseLoginPanel(message.userId, false);
 				clearCurrentProblem({ notifyExtension: false });
@@ -1112,6 +1283,9 @@ function renderSubmissionState() {
 					restoredPasswordField.value = '';
 				}
 				updateSavedPasswordButton();
+				if ('preferredLanguage' in message) {
+					setPreferredLanguage(message.preferredLanguage);
+				}
 				const problemsetState = message.problemset ?? null;
 				const cachedProblem = message.lastProblem ?? null;
 				const cachedProblemValid = Boolean(
@@ -1206,6 +1380,9 @@ function renderSubmissionState() {
 					savedPasswordField.value = '';
 				}
 				updateSavedPasswordButton();
+				if ('preferredLanguage' in message) {
+					setPreferredLanguage(message.preferredLanguage);
+				}
 				setStatus(loginStatus, '自动登录未成功，请手动登录', true);
 				expandLoginPanel();
 				break;
