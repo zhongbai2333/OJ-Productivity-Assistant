@@ -60,20 +60,31 @@ jobs:
             const releases = releasesResp.data || [];
             const tags = releases.map((release) => release.tag_name);
             const idx = tags.indexOf(tag);
-            const prevRelease = idx >= 0 && idx < releases.length - 1 ? releases[idx + 1] : null;
-            const since = prevRelease ? prevRelease.published_at : null;
+            let prevRelease = null;
+            if (idx >= 0 && idx < releases.length - 1) {
+              prevRelease = releases[idx + 1];
+            } else if (idx === -1 && releases.length > 0) {
+              prevRelease = releases[0];
+            }
+            const sinceSource = prevRelease ? (prevRelease.published_at || prevRelease.created_at) : null;
+            const since = sinceSource ? new Date(sinceSource).toISOString() : null;
             const prevTag = prevRelease ? prevRelease.tag_name : null;
             const compareUrl = prevTag ? `https://github.com/${owner}/${repo}/compare/${prevTag}...${tag}` : '';
 
-            const params = { owner, repo, state: 'closed', per_page: 100 };
-            if (since) {
-              params.since = since;
-            }
+            const searchQuery = `repo:${owner}/${repo} is:issue is:closed${since ? ` closed:>=${since}` : ''}`;
 
-            const issuesResp = await github.rest.issues.listForRepo(params);
-            const items = (issuesResp.data || []).filter((item) =>
-              !(item.labels || []).some((lbl) => ['wontfix', 'duplicate'].includes(lbl.name?.toLowerCase() ?? ''))
-            );
+            const searchResults = await github.paginate(github.rest.search.issuesAndPullRequests, {
+              q: searchQuery,
+              per_page: 100,
+              sort: 'updated',
+              order: 'desc',
+            });
+
+            const items = (searchResults || [])
+              .filter((item) => !item.pull_request)
+              .filter((item) =>
+                !(item.labels || []).some((lbl) => ['wontfix', 'duplicate'].includes(lbl.name?.toLowerCase() ?? ''))
+              );
 
             const groups = { Fix: [], Update: [], Feature: [] };
             for (const item of items) {
