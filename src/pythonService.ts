@@ -11,7 +11,7 @@ export class PythonService {
     private readonly scriptPath: string;
 
     public constructor(private readonly context: vscode.ExtensionContext) {
-    this.scriptPath = vscode.Uri.joinPath(context.extensionUri, 'core.py').fsPath;
+        this.scriptPath = vscode.Uri.joinPath(context.extensionUri, 'core.py').fsPath;
     }
 
     public async execute<T>(action: string, payload: Record<string, unknown>): Promise<T> {

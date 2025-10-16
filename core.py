@@ -112,6 +112,16 @@ ALLOWED_RICH_ATTRS: Dict[str, Set[str]] = {
     "tfoot": set(),
 }
 
+RICH_CONTENT_MARKERS: Tuple[str, ...] = (
+    "<img",
+    "<table",
+    "<iframe",
+    "<sup",
+    "<sub",
+    "<math",
+    "<svg",
+)
+
 
 def _normalize_newlines(value: str) -> str:
     return value.replace("\r\n", "\n").replace("\r", "\n")
@@ -143,7 +153,7 @@ def _normalize_sample(value: str) -> str:
     lines = [line.rstrip().replace("\xa0", " ") for line in text.split("\n")]
     normalized: List[str] = []
     blank_pending = False
-    for line in lines: 
+    for line in lines:
         if line:
             normalized.append(line)
             blank_pending = False
@@ -155,7 +165,9 @@ def _normalize_sample(value: str) -> str:
     return "\n".join(normalized)
 
 
-def _ensure_authenticated(response: requests.Response, soup: Optional[bs4.BeautifulSoup] = None) -> None:
+def _ensure_authenticated(
+    response: requests.Response, soup: Optional[bs4.BeautifulSoup] = None
+) -> None:
     final_url = (response.url or "").lower()
     if "login.php" in final_url:
         raise PermissionError(AUTH_REQUIRED_ERROR)
@@ -201,7 +213,9 @@ def login(username, secret, is_hashed=False):
 
     csrf_token = csrf_input["value"]
 
-    password_hash = secret if is_hashed else hashlib.md5(secret.encode("utf-8")).hexdigest()
+    password_hash = (
+        secret if is_hashed else hashlib.md5(secret.encode("utf-8")).hexdigest()
+    )
 
     payload = {
         "user_id": username,
@@ -254,8 +268,16 @@ def fetch_problemset(session, start_page=1, max_pages=None):
             problem_id = columns[1].get_text(strip=True)
 
             title_link = columns[2].find("a")
-            title = title_link.get_text(strip=True) if title_link else columns[2].get_text(strip=True)
-            problem_url = urljoin(BASE_URL, title_link["href"]) if title_link and title_link.get("href") else None
+            title = (
+                title_link.get_text(strip=True)
+                if title_link
+                else columns[2].get_text(strip=True)
+            )
+            problem_url = (
+                urljoin(BASE_URL, title_link["href"])
+                if title_link and title_link.get("href")
+                else None
+            )
 
             solved = submitted = None
             solved_submitted_text = columns[3].get_text(strip=True)
@@ -403,7 +425,10 @@ def _fetch_image_as_data_url(session: requests.Session, url: str) -> Optional[st
     if not content or len(content) > MAX_EMBED_IMAGE_SIZE:
         _IMAGE_DATA_CACHE[url] = None
         return None
-    mime_type = _guess_mime_type(url, response.headers.get("content-type")) or "application/octet-stream"
+    mime_type = (
+        _guess_mime_type(url, response.headers.get("content-type"))
+        or "application/octet-stream"
+    )
     if not mime_type.startswith("image/"):
         _IMAGE_DATA_CACHE[url] = None
         return None
@@ -413,7 +438,9 @@ def _fetch_image_as_data_url(session: requests.Session, url: str) -> Optional[st
     return data_url
 
 
-def _embed_protected_images(soup: bs4.BeautifulSoup, session: requests.Session, base_url: str) -> None:
+def _embed_protected_images(
+    soup: bs4.BeautifulSoup, session: requests.Session, base_url: str
+) -> None:
     for tag in soup.find_all("img"):
         src = tag.get("src")
         if not src:
@@ -476,7 +503,9 @@ def _sanitize_rich_content(html: str) -> str:
                     child.extract()
                     continue
                 meaningful_children.append(child)
-            if meaningful_children and all(getattr(child, "name", None) == "img" for child in meaningful_children):
+            if meaningful_children and all(
+                getattr(child, "name", None) == "img" for child in meaningful_children
+            ):
                 tag.unwrap()
 
     for br in fragment.find_all("br"):
@@ -493,9 +522,17 @@ def _sanitize_rich_content(html: str) -> str:
         next_text = br.next_sibling
         while isinstance(next_text, NavigableString) and not next_text.strip():
             next_text = next_text.next_sibling
-        if prev_text is None or (isinstance(prev_text, Tag) and prev_text.name in {"section", "div", "p"} and not prev_text.get_text(strip=True)):
+        if prev_text is None or (
+            isinstance(prev_text, Tag)
+            and prev_text.name in {"section", "div", "p"}
+            and not prev_text.get_text(strip=True)
+        ):
             br.decompose()
-        elif next_text is None or (isinstance(next_text, Tag) and next_text.name in {"section", "div", "p"} and not next_text.get_text(strip=True)):
+        elif next_text is None or (
+            isinstance(next_text, Tag)
+            and next_text.name in {"section", "div", "p"}
+            and not next_text.get_text(strip=True)
+        ):
             br.decompose()
 
     for span in fragment.find_all("span"):
@@ -504,7 +541,9 @@ def _sanitize_rich_content(html: str) -> str:
 
     body = fragment.body or fragment
     sanitized = body.decode_contents()
-    sanitized = re.sub(r"(?:\s*<br\s*/?>\s*){3,}", "<br /><br />", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(
+        r"(?:\s*<br\s*/?>\s*){3,}", "<br /><br />", sanitized, flags=re.IGNORECASE
+    )
     sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
     return sanitized.strip()
 
@@ -553,7 +592,7 @@ def fetch_problem(session, problem_id):
             return _normalize_sample(text_content)
         normalized = _normalize_paragraph(text_content)
         html_lower = html.lower()
-        if any(marker in html_lower for marker in ("<img", "<table", "<iframe")):
+        if any(marker in html_lower for marker in RICH_CONTENT_MARKERS):
             return _sanitize_rich_content(html)
         return normalized
 
@@ -564,12 +603,14 @@ def fetch_problem(session, problem_id):
         fragment = bs4.BeautifulSoup(value, "html.parser")
         plain_text = fragment.get_text("\n", strip=False)
         html_lower = value.lower()
-        if any(marker in html_lower for marker in ("<img", "<table", "<iframe")):
+        if any(marker in html_lower for marker in RICH_CONTENT_MARKERS):
             raw_sections[title] = _sanitize_rich_content(value)
         else:
             raw_sections[title] = _normalize_paragraph(plain_text)
 
-    has_external_resources = any("<img" in value.lower() for value in sections.values() if value)
+    has_external_resources = any(
+        "<img" in value.lower() for value in sections.values() if value
+    )
 
     problem_data = {
         "problem_id": header_info.get("problem_id") or str(problem_id),
@@ -578,8 +619,12 @@ def fetch_problem(session, problem_id):
         "description": _clean_value("description", _get_section_value("description")),
         "input": _clean_value("input", _get_section_value("input")),
         "output": _clean_value("output", _get_section_value("output")),
-        "sample_input": _clean_value("sample_input", _get_section_value("sample_input")),
-        "sample_output": _clean_value("sample_output", _get_section_value("sample_output")),
+        "sample_input": _clean_value(
+            "sample_input", _get_section_value("sample_input")
+        ),
+        "sample_output": _clean_value(
+            "sample_output", _get_section_value("sample_output")
+        ),
         "hint": _clean_value("hint", _get_section_value("hint")),
         "source": _clean_value("source", _get_section_value("source")),
         "tags": tags,
@@ -708,7 +753,18 @@ def _extract_solution_id_from_cell(cell: Tag) -> Optional[int]:
     return None
 
 
-def _status_entry_key(entry: Dict[str, Optional[str]]) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+def _status_entry_key(
+    entry: Dict[str, Optional[str]],
+) -> Tuple[
+    Optional[int],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]:
     return (
         entry.get("solution_id"),
         entry.get("submitted_at"),
@@ -727,7 +783,10 @@ def _status_entry_sort_key(entry: Dict[str, Optional[str]]) -> Tuple[int, str]:
     solution_order = solution_id if isinstance(solution_id, int) else -1
     return (solution_order, submitted_at)
 
-def _prepare_submit_payload(session, problem_id, language, source_code, contest_problem_id):
+
+def _prepare_submit_payload(
+    session, problem_id, language, source_code, contest_problem_id
+):
     submit_page_url = urljoin(BASE_URL, f"submitpage.php?id={problem_id}")
     response = session.get(submit_page_url, timeout=10)
     response.raise_for_status()
@@ -774,11 +833,15 @@ def _prepare_submit_payload(session, problem_id, language, source_code, contest_
     return payload
 
 
-def submit_solution(session, user_id, problem_id, source_code, language=6, contest_problem_id=0):
+def submit_solution(
+    session, user_id, problem_id, source_code, language=6, contest_problem_id=0
+):
     pre_entries = fetch_status_list(session, user_id, limit=20)
     seen_keys = {_status_entry_key(entry) for entry in pre_entries}
 
-    payload = _prepare_submit_payload(session, problem_id, language, source_code, contest_problem_id)
+    payload = _prepare_submit_payload(
+        session, problem_id, language, source_code, contest_problem_id
+    )
 
     submit_url = urljoin(BASE_URL, "submit.php")
     headers = {"Referer": urljoin(BASE_URL, f"submitpage.php?id={problem_id}")}
@@ -801,7 +864,21 @@ def submit_solution(session, user_id, problem_id, source_code, language=6, conte
     raise ValueError("新提交记录未在状态列表中出现")
 
 
-def _find_new_submission(entries: List[Dict[str, Optional[str]]], seen_keys: Set[Tuple[Optional[int], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]]) -> Optional[Dict[str, Optional[str]]]:
+def _find_new_submission(
+    entries: List[Dict[str, Optional[str]]],
+    seen_keys: Set[
+        Tuple[
+            Optional[int],
+            Optional[str],
+            Optional[str],
+            Optional[str],
+            Optional[str],
+            Optional[str],
+            Optional[str],
+            Optional[str],
+        ]
+    ],
+) -> Optional[Dict[str, Optional[str]]]:
     if not entries:
         return None
 
@@ -829,11 +906,15 @@ def query_submission_result(session, solution_id):
     try:
         result_code = int(parts[0])
     except ValueError as exc:
-        raise ValueError(f"Invalid result code in status-ajax response: {parts[0]}") from exc
+        raise ValueError(
+            f"Invalid result code in status-ajax response: {parts[0]}"
+        ) from exc
 
     memory = parts[1] if len(parts) > 1 and parts[1] else None
     time_used = parts[2] if len(parts) > 2 and parts[2] else None
-    extra = parts[3] if len(parts) > 3 and parts[3] and parts[3].lower() != "none" else None
+    extra = (
+        parts[3] if len(parts) > 3 and parts[3] and parts[3].lower() != "none" else None
+    )
     ac_rate = parts[4] if len(parts) > 4 and parts[4] else None
 
     return {
@@ -848,7 +929,9 @@ def query_submission_result(session, solution_id):
     }
 
 
-def poll_submission(session, solution_id, max_attempts=12, initial_delay=1.0, backoff=1.5):
+def poll_submission(
+    session, solution_id, max_attempts=12, initial_delay=1.0, backoff=1.5
+):
     delay = initial_delay
     last_status = None
     for _ in range(max_attempts):
@@ -886,7 +969,11 @@ def _handle_action(request: Dict[str, Any]) -> Dict[str, Any]:
     if action == "fetch_problemset":
         start_page = request.get("start_page", 1)
         max_pages = request.get("max_pages")
-        return {"problemset": fetch_problemset(session, start_page=start_page, max_pages=max_pages)}
+        return {
+            "problemset": fetch_problemset(
+                session, start_page=start_page, max_pages=max_pages
+            )
+        }
 
     if action == "fetch_problem":
         problem_id = request.get("problem_id")
@@ -908,7 +995,9 @@ def _handle_action(request: Dict[str, Any]) -> Dict[str, Any]:
         language = request.get("language", 6)
         contest_problem_id = request.get("contest_problem_id", 0)
         if not user_id or problem_id is None or source_code is None:
-            raise ValueError("user_id, problem_id, and source_code are required for submission")
+            raise ValueError(
+                "user_id, problem_id, and source_code are required for submission"
+            )
         submission = submit_solution(
             session,
             user_id=user_id,
@@ -946,7 +1035,11 @@ def _main():
     try:
         request = json.loads(raw)
     except json.JSONDecodeError as exc:
-        print(json.dumps({"ok": False, "error": f"Invalid JSON: {exc}"}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"ok": False, "error": f"Invalid JSON: {exc}"}, ensure_ascii=False
+            )
+        )
         return
 
     try:

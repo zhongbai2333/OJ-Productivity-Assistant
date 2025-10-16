@@ -212,7 +212,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
             }),
         );
 
-    this.postMessage({ type: 'problemset', payload: data.problemset });
+        this.postMessage({ type: 'problemset', payload: data.problemset });
         await this.mutatePersistedSession((persisted) => {
             persisted.problemset = {
                 data: data.problemset,
@@ -255,7 +255,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 limit,
             }),
         );
-    this.postMessage({ type: 'status', payload: data.status });
+        this.postMessage({ type: 'status', payload: data.status });
     }
 
     private async handleCreateFile(problemId: number, language: string): Promise<void> {
@@ -289,9 +289,9 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         const document = await vscode.workspace.openTextDocument(fileUri);
         await vscode.window.showTextDocument(document);
 
-    const relativePath = vscode.workspace.asRelativePath(fileUri);
-    this.postMessage({ type: 'fileCreated', path: relativePath });
-    await this.persistPreferredLanguage(language);
+        const relativePath = vscode.workspace.asRelativePath(fileUri);
+        this.postMessage({ type: 'fileCreated', path: relativePath });
+        await this.persistPreferredLanguage(language);
     }
 
     private async handleSubmitSolution(problemId: number, language: string, filePath: string, contestProblemId?: number): Promise<void> {
@@ -393,7 +393,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                     if (!entry || typeof entry !== 'object') {
                         continue;
                     }
-                    const problemRecord = entry as { problem_id?: number | string; [key: string]: unknown };
+                    const problemRecord = entry as { problem_id?: number | string;[key: string]: unknown };
                     const entryId = Number(problemRecord.problem_id);
                     if (!Number.isFinite(entryId) || entryId !== numericId) {
                         continue;
