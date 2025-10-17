@@ -2,7 +2,7 @@
     "name": "oj-productivity-assistant",
     "displayName": "OJ Productivity Assistant",
     "description": "Streamline interactions with the 2024.jdoj.tech OJ platform from VS Code.",
-    "version": "0.0.6",
+    "version": "0.0.7",
     "publisher": "zhongbai233",
     "engines": {
         "vscode": "^1.105.0"
