@@ -3,13 +3,14 @@
     "displayName": "OJ Productivity Assistant",
     "description": "Streamline interactions with the 2024.jdoj.tech OJ platform from VS Code.",
     "version": "0.0.6",
-    "publisher": "ojassistant",
+    "publisher": "zhongbai233",
     "engines": {
         "vscode": "^1.105.0"
     },
     "categories": [
         "Other"
     ],
+    "icon": "media/MainIcon.png",
     "activationEvents": [],
     "main": "./dist/extension.js",
     "contributes": {
