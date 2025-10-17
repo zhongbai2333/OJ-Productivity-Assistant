@@ -566,6 +566,44 @@ def fetch_problem(session, problem_id):
     response.raise_for_status()
 
     soup = bs4.BeautifulSoup(response.text, "html.parser")
+    private_notice = soup.select_one("div.ui.negative.icon.message")
+    if private_notice is not None:
+        sanitized_notice = _sanitize_rich_content(str(private_notice))
+        header = private_notice.select_one(".header")
+        header_text = header.get_text("\n", strip=True) if header else private_notice.get_text("\n", strip=True)
+        message_text = _normalize_paragraph(header_text)
+        contest_links = []
+        for link in private_notice.select('a[href*="contest.php"]'):
+            href = link.get("href")
+            if not href:
+                continue
+            contest_links.append(
+                {
+                    "name": link.get_text(strip=True) or href,
+                    "url": urljoin(problem_url, href),
+                }
+            )
+        return {
+            "problem_id": str(problem_id),
+            "title": None,
+            "raw_title": None,
+            "metadata": {},
+            "description": None,
+            "input": None,
+            "output": None,
+            "sample_input": None,
+            "sample_output": None,
+            "hint": None,
+            "source": None,
+            "tags": [],
+            "raw_sections": {},
+            "url": problem_url,
+            "hasExternalResources": False,
+            "is_private": True,
+            "private_notice": sanitized_notice,
+            "private_message": message_text,
+            "private_contests": contest_links,
+        }
     _absolutize_resources(soup, problem_url)
     _embed_protected_images(soup, session, problem_url)
 

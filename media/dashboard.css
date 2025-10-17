@@ -386,6 +386,42 @@ th.placeholder {
     word-break: break-word;
 }
 
+.problem-private {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+    border-radius: 8px;
+    border: 1px solid var(--vscode-input-border, rgba(255, 255, 255, 0.12));
+    background: rgba(255, 215, 0, 0.08);
+}
+
+.problem-private h3 {
+    margin: 0;
+    font-size: 1rem;
+}
+
+.problem-private .notice {
+    font-size: 0.95rem;
+    line-height: 1.5;
+}
+
+.private-contest-list {
+    margin: 0;
+    padding-left: 20px;
+    font-size: 0.95rem;
+    line-height: 1.5;
+}
+
+.problem-private details {
+    margin-top: 4px;
+}
+
+.problem-private details > summary {
+    cursor: pointer;
+    font-weight: 600;
+}
+
 .tag-list {
     display: flex;
     flex-wrap: wrap;

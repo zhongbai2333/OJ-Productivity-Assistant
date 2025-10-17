@@ -976,6 +976,56 @@ function renderProblemDetail(problem) {
     };
     resetSampleTestUI();
     updateSampleTestAvailability();
+    if (problem.is_private) {
+        const problemIdLabel = problem.problem_id ?? '-';
+        const displayTitle = problem.raw_title || problem.title || `题目 ${problemIdLabel}`;
+        const problemUrl = problem.url
+            ? `<a href="${escapeHtml(problem.url)}" target="_blank">查看原题</a>`
+            : '<span>无原题链接</span>';
+        const contests = Array.isArray(problem.private_contests) ? problem.private_contests : [];
+        const friendlyMessage = problem.private_message
+            ? escapeHtml(problem.private_message)
+            : '题目正用于私有比赛，当前无法查看题面内容。';
+        const contestList = contests.length
+            ? `
+                <p>目前包含在以下私有比赛中：</p>
+                <ul class="private-contest-list">
+                    ${contests
+                        .map((contest) => {
+                            const name = escapeHtml(contest.name ?? '未知比赛');
+                            const url = contest.url ? `<a href="${escapeHtml(contest.url)}" target="_blank">${name}</a>` : name;
+                            return `<li>${url}</li>`;
+                        })
+                        .join('')}
+                </ul>
+            `
+            : '<p>该题目正用于私有比赛，因此暂不可浏览题面。</p>';
+        const rawNotice = problem.private_notice ? sanitizeHtml(problem.private_notice) : '';
+        const headerHtml = `
+            <div class="problem-header">
+                <h3>${escapeHtml(displayTitle)}</h3>
+                <div class="problem-meta">
+                    <span>编号：${escapeHtml(String(problemIdLabel))}</span>
+                    <span>来源：${problemUrl}</span>
+                </div>
+            </div>
+        `;
+        const detailsHtml = rawNotice
+            ? `
+                <details class="notice-raw">
+                    <summary>查看平台原始提示</summary>
+                    <div>${rawNotice}</div>
+                </details>
+            `
+            : '';
+        problemOutput.innerHTML = `${headerHtml}<div class="problem-private"><h3>无法查看题目详情</h3><p>${friendlyMessage}</p>${contestList}${detailsHtml}</div>`;
+        problemActions.classList.add('hidden');
+        setStatus(fileStatus, '');
+        renderSubmissionState();
+        state.pendingRestore = false;
+        syncProblemControls();
+        return;
+    }
     const sections = [];
     const seenContent = new Set();
     const pushSection = (title, rawValue, formatter = formatParagraph) => {
