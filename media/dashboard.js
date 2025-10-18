@@ -39,6 +39,7 @@ const state = {
         loading: false,
         error: null,
     },
+    includeSummaryInTemplate: true,
 };
 
 let selectedProblemRow = null;
@@ -59,6 +60,7 @@ const detailFileForm = document.getElementById('detail-file-form');
 const detailSubmitForm = document.getElementById('detail-submit-form');
 const languageSelect = document.getElementById('language-select');
 const submitFileInput = detailSubmitForm.querySelector('input[name="filePath"]');
+const includeSummaryCheckbox = detailFileForm.querySelector('input[name="includeSummary"]');
 const submissionOutput = document.getElementById('submission-output');
 const statusForm = document.getElementById('status-form');
 const statusTable = document.getElementById('status-table');
@@ -75,6 +77,13 @@ const navNextButton = document.getElementById('nav-next-button');
 if (languageSelect) {
     languageSelect.addEventListener('change', () => {
         setPreferredLanguage(String(languageSelect.value), { notifyExtension: true });
+    });
+}
+
+if (includeSummaryCheckbox) {
+    setIncludeSummaryPreference(includeSummaryCheckbox.checked);
+    includeSummaryCheckbox.addEventListener('change', () => {
+        setIncludeSummaryPreference(includeSummaryCheckbox.checked, { notifyExtension: true });
     });
 }
 
@@ -342,6 +351,21 @@ function setPreferredLanguage(value, options = {}) {
         vscode.postMessage({
             type: 'setPreferredLanguage',
             payload: { language: normalized },
+        });
+    }
+}
+
+function setIncludeSummaryPreference(value, options = {}) {
+    const normalized = Boolean(value);
+    const changed = normalized !== state.includeSummaryInTemplate;
+    state.includeSummaryInTemplate = normalized;
+    if (includeSummaryCheckbox && includeSummaryCheckbox.checked !== normalized) {
+        includeSummaryCheckbox.checked = normalized;
+    }
+    if (options.notifyExtension && changed) {
+        vscode.postMessage({
+            type: 'setIncludeSummaryPreference',
+            payload: { includeSummary: normalized },
         });
     }
 }
@@ -1244,10 +1268,11 @@ detailFileForm.addEventListener('submit', (event) => {
     }
     const formData = new FormData(detailFileForm);
     const language = String(formData.get('language'));
+    const includeSummary = state.includeSummaryInTemplate;
     setStatus(fileStatus, '处理中…');
     vscode.postMessage({
         type: 'createFile',
-        payload: { problemId: state.currentProblemId, language },
+        payload: { problemId: state.currentProblemId, language, includeSummary },
     });
 });
 
@@ -1329,6 +1354,9 @@ window.addEventListener('message', (event) => {
             if ('preferredLanguage' in message) {
                 setPreferredLanguage(message.preferredLanguage);
             }
+            if ('includeSummaryInTemplate' in message) {
+                setIncludeSummaryPreference(Boolean(message.includeSummaryInTemplate), { notifyExtension: false });
+            }
             setStatus(loginStatus, `已登录为 ${message.userId}`);
             collapseLoginPanel(message.userId, false);
             clearCurrentProblem({ notifyExtension: false });
@@ -1355,6 +1383,9 @@ window.addEventListener('message', (event) => {
             updateSavedPasswordButton();
             if ('preferredLanguage' in message) {
                 setPreferredLanguage(message.preferredLanguage);
+            }
+            if ('includeSummaryInTemplate' in message) {
+                setIncludeSummaryPreference(Boolean(message.includeSummaryInTemplate), { notifyExtension: false });
             }
             const problemsetState = message.problemset ?? null;
             const cachedProblem = message.lastProblem ?? null;
@@ -1452,6 +1483,9 @@ window.addEventListener('message', (event) => {
             updateSavedPasswordButton();
             if ('preferredLanguage' in message) {
                 setPreferredLanguage(message.preferredLanguage);
+            }
+            if ('includeSummaryInTemplate' in message) {
+                setIncludeSummaryPreference(Boolean(message.includeSummaryInTemplate), { notifyExtension: false });
             }
             setStatus(loginStatus, '自动登录未成功，请手动登录', true);
             expandLoginPanel();

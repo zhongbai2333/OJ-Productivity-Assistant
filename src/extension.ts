@@ -26,6 +26,7 @@ interface PersistedSession {
     problemset?: PersistedProblemsetState;
     lastProblem?: PersistedProblemState;
     preferredLanguage?: string;
+    includeSummaryInTemplate?: boolean;
 }
 
 interface SessionState {
@@ -38,12 +39,44 @@ type WebviewMessage =
     | { type: 'fetchProblemset'; payload: { startPage: number; maxPages?: number | null } }
     | { type: 'fetchProblem'; payload: { problemId: number } }
     | { type: 'fetchStatus'; payload: { limit: number } }
-    | { type: 'createFile'; payload: { problemId: number; language: string } }
+    | { type: 'createFile'; payload: { problemId: number; language: string; includeSummary?: boolean } }
     | { type: 'submitSolution'; payload: { problemId: number; language: string; filePath: string; contestProblemId?: number | null } }
     | { type: 'selectProblem'; payload: { problemId: number | null } }
     | { type: 'runSampleTest'; payload: { problemId: number | null; language: string; filePath: string; sampleInput: string; expectedOutput?: string | null } }
     | { type: 'updateProblemStatus'; payload: { problemId: number; accepted: boolean } }
-    | { type: 'setPreferredLanguage'; payload: { language: string } };
+    | { type: 'setPreferredLanguage'; payload: { language: string } }
+    | { type: 'setIncludeSummaryPreference'; payload: { includeSummary: boolean } };
+
+interface ProblemPayload {
+    problem_id?: number | string;
+    title?: string | null;
+    description?: string | null;
+    input?: string | null;
+    output?: string | null;
+    url?: string | null;
+    is_private?: boolean;
+    private_message?: string | null;
+    sample_input?: string | null;
+    sample_output?: string | null;
+    [key: string]: unknown;
+}
+
+interface ProblemCacheEntry {
+    readonly problemId: number;
+    readonly data: ProblemPayload | undefined;
+    readonly fetchedAt: number;
+}
+
+interface ProblemSummary {
+    problemId: string;
+    title?: string;
+    url?: string;
+    description?: string;
+    input?: string;
+    output?: string;
+    note?: string;
+    language?: string;
+}
 
 export function activate(context: vscode.ExtensionContext) {
     const provider = new OJAssistantProvider(context);
@@ -61,6 +94,9 @@ export function activate(context: vscode.ExtensionContext) {
 export function deactivate() { }
 
 class OJAssistantProvider implements vscode.WebviewViewProvider {
+    private static readonly PROBLEM_SUMMARY_START = 'OJ-Problem-Info: START';
+    private static readonly PROBLEM_SUMMARY_END = 'OJ-Problem-Info: END';
+    private static readonly PROBLEM_SUMMARY_DISABLED = 'OJ-Problem-Info: SUMMARY_DISABLED';
     private view?: vscode.WebviewView;
     private readonly python: PythonService;
     private session: SessionState | undefined;
@@ -72,6 +108,8 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
     private readonly stateFileName = 'session.json';
     private warnedMissingWorkspace = false;
     private preferredLanguage = 'python';
+    private includeSummaryInTemplate = true;
+    private readonly problemCache = new Map<number, ProblemCacheEntry>();
 
     public constructor(private readonly context: vscode.ExtensionContext) {
         this.python = new PythonService(context);
@@ -120,7 +158,11 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                     await this.handleFetchStatus(message.payload.limit);
                     break;
                 case 'createFile':
-                    await this.handleCreateFile(message.payload.problemId, message.payload.language);
+                    await this.handleCreateFile(
+                        message.payload.problemId,
+                        message.payload.language,
+                        message.payload.includeSummary,
+                    );
                     break;
                 case 'submitSolution':
                     await this.handleSubmitSolution(
@@ -144,6 +186,9 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'setPreferredLanguage':
                     await this.persistPreferredLanguage(message.payload.language);
+                    break;
+                case 'setIncludeSummaryPreference':
+                    await this.persistIncludeSummaryPreference(message.payload.includeSummary);
                     break;
                 case 'updateProblemStatus':
                     await this.handleUpdateProblemStatus(message.payload.problemId, message.payload.accepted);
@@ -198,6 +243,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
             rememberPassword: remember,
             hasSavedPassword: this.hasSavedPassword(),
             preferredLanguage: this.preferredLanguage,
+            includeSummaryInTemplate: this.includeSummaryInTemplate,
         });
     }
 
@@ -232,6 +278,8 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 problem_id: problemId,
             }),
         );
+        const problemPayload = this.asProblemPayload(data.problem);
+        this.cacheProblem(problemId, problemPayload);
         this.postMessage({ type: 'problem', payload: data.problem });
         await this.mutatePersistedSession((persisted) => {
             persisted.currentProblemId = problemId;
@@ -258,10 +306,16 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         this.postMessage({ type: 'status', payload: data.status });
     }
 
-    private async handleCreateFile(problemId: number, language: string): Promise<void> {
+    private async handleCreateFile(problemId: number, language: string, includeSummary?: boolean): Promise<void> {
         const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
         if (!workspaceFolder) {
             throw new Error('请先打开一个工作区目录');
+        }
+
+        const includeSummaryPreference =
+            typeof includeSummary === 'boolean' ? includeSummary : this.includeSummaryInTemplate;
+        if (typeof includeSummary === 'boolean' && includeSummary !== this.includeSummaryInTemplate) {
+            await this.persistIncludeSummaryPreference(includeSummary);
         }
 
         const config = vscode.workspace.getConfiguration('ojAssistant');
@@ -282,7 +336,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
 
         const exists = await this.fileExists(fileUri);
         if (!exists) {
-            const template = this.getTemplateForLanguage(language, problemId);
+            const template = await this.generateTemplateForLanguage(language, problemId, includeSummaryPreference);
             await vscode.workspace.fs.writeFile(fileUri, Buffer.from(template, 'utf8'));
         }
 
@@ -301,12 +355,13 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
             const fileUri = this.resolveFileUri(filePath);
             const sourceBuffer = await vscode.workspace.fs.readFile(fileUri);
             const sourceCode = Buffer.from(sourceBuffer).toString('utf8');
+            const preparedSource = this.prepareSourceForSubmission(language, sourceCode);
 
             const submission = await this.python.execute<{ submission: { solution_id?: number } }>('submit_solution', {
                 cookies: session.cookies,
                 user_id: session.userId,
                 problem_id: problemId,
-                source_code: sourceCode,
+                source_code: preparedSource,
                 language: languageCode,
                 contest_problem_id: contestProblemId ?? 0,
             });
@@ -413,6 +468,8 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         switch (language) {
             case 'python':
                 return this.runPythonSample(filePath, sampleInput, expectedOutput);
+            case 'cpp':
+                return this.runCppSample(filePath, sampleInput, expectedOutput);
             case 'java':
                 return this.runJavaSample(filePath, sampleInput, expectedOutput);
             default:
@@ -436,6 +493,54 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
             exitCode: result.exitCode,
             matched,
         };
+    }
+
+    private async runCppSample(
+        filePath: string,
+        sampleInput: string,
+        expectedOutput?: string,
+    ): Promise<{ stdout: string; stderr: string; exitCode: number | null; matched?: boolean }> {
+        const config = vscode.workspace.getConfiguration('ojAssistant');
+        const compilerBinary = (config.get<string>('cppCompilerPath', 'g++') || 'g++').trim() || 'g++';
+        const compileArgsSetting = config.get<string[]>('cppCompileArgs', ['-std=c++17', '-O2']);
+        const compileArgsCandidates = Array.isArray(compileArgsSetting) ? compileArgsSetting : ['-std=c++17', '-O2'];
+        const compileArgs = compileArgsCandidates
+            .map((arg) => `${arg}`.trim())
+            .filter((arg) => arg.length > 0);
+        const effectiveCompileArgs = compileArgs.length > 0 ? compileArgs : ['-std=c++17', '-O2'];
+        const runtimeArgsSetting = config.get<string[]>('cppRuntimeArgs', []);
+        const runtimeArgsCandidates = Array.isArray(runtimeArgsSetting) ? runtimeArgsSetting : [];
+        const runtimeArgs = runtimeArgsCandidates.map((arg) => `${arg}`);
+
+        const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oj-assistant-cpp-'));
+        const outputName = process.platform === 'win32' ? 'main.exe' : 'main';
+        const outputPath = path.join(tempDir, outputName);
+
+        try {
+            const compileCommandArgs = [...effectiveCompileArgs, filePath, '-o', outputPath];
+            const compileResult = await this.runProcess(compilerBinary, compileCommandArgs, '', path.dirname(filePath));
+            if (compileResult.exitCode !== 0) {
+                const message = (compileResult.stderr || compileResult.stdout || '').trim() || '未知的编译错误';
+                throw new Error(`C++ 编译失败：\n${message}`);
+            }
+
+            const runResult = await this.runProcess(outputPath, runtimeArgs, sampleInput, path.dirname(filePath));
+            const normalizedStdout = this.normalizeProgramOutput(runResult.stdout);
+            const normalizedExpected = expectedOutput === undefined ? undefined : this.normalizeProgramOutput(expectedOutput);
+            const matched = normalizedExpected !== undefined ? normalizedStdout === normalizedExpected : undefined;
+            return {
+                stdout: runResult.stdout,
+                stderr: runResult.stderr,
+                exitCode: runResult.exitCode,
+                matched,
+            };
+        } finally {
+            try {
+                await fs.rm(tempDir, { recursive: true, force: true });
+            } catch {
+                // ignore cleanup failures
+            }
+        }
     }
 
     private async runJavaSample(
@@ -576,6 +681,14 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         this.preferredLanguage = normalized;
         await this.mutatePersistedSession((persisted) => {
             persisted.preferredLanguage = normalized;
+        });
+    }
+
+    private async persistIncludeSummaryPreference(includeSummary: boolean): Promise<void> {
+        const normalized = Boolean(includeSummary);
+        this.includeSummaryInTemplate = normalized;
+        await this.mutatePersistedSession((persisted) => {
+            persisted.includeSummaryInTemplate = normalized;
         });
     }
 
@@ -720,6 +833,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 userId: this.savedCredentials?.userId ?? this.session?.userId ?? '',
                 rememberPassword: this.savedCredentials?.rememberPassword ?? false,
                 preferredLanguage: this.preferredLanguage,
+                includeSummaryInTemplate: this.includeSummaryInTemplate,
             };
             if (persisted.rememberPassword && this.savedCredentials?.passwordHash) {
                 persisted.passwordHash = this.savedCredentials.passwordHash;
@@ -737,6 +851,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         }
         mutator(persisted);
         persisted.savedAt = Date.now();
+        persisted.includeSummaryInTemplate = this.includeSummaryInTemplate;
         await this.writePersistedSession(persisted);
     }
 
@@ -846,6 +961,9 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         if (persisted.preferredLanguage) {
             this.preferredLanguage = this.normalizeLanguage(persisted.preferredLanguage);
         }
+        if (typeof persisted.includeSummaryInTemplate === 'boolean') {
+            this.includeSummaryInTemplate = persisted.includeSummaryInTemplate;
+        }
         const rememberPassword = Boolean(persisted.rememberPassword);
         const passwordHash = rememberPassword ? persisted.passwordHash : undefined;
         this.savedCredentials = {
@@ -857,6 +975,9 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         const cachedProblemId = typeof persisted.currentProblemId === 'number' ? persisted.currentProblemId : null;
         const cachedProblemset = persisted.problemset;
         const cachedProblem = persisted.lastProblem;
+        if (cachedProblem && typeof cachedProblem.problemId === 'number') {
+            this.cacheProblem(cachedProblem.problemId, this.asProblemPayload(cachedProblem.data));
+        }
 
         if (rememberPassword && passwordHash) {
             const success = await this.tryAutoLoginInternal(persisted.userId, passwordHash, { clearCachedData: false });
@@ -871,6 +992,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                     lastProblem: cachedProblem,
                     hasSavedPassword: this.hasSavedPassword(),
                     preferredLanguage: this.preferredLanguage,
+                    includeSummaryInTemplate: this.includeSummaryInTemplate,
                 });
                 return;
             }
@@ -882,6 +1004,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
             rememberPassword,
             hasSavedPassword: this.hasSavedPassword(),
             preferredLanguage: this.preferredLanguage,
+            includeSummaryInTemplate: this.includeSummaryInTemplate,
         });
     }
 
@@ -972,6 +1095,10 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                     <form id="detail-file-form" class="inline-form">
                         <label>语言
                             <select name="language" id="language-select"></select>
+                        </label>
+                        <label class="inline-checkbox">
+                            <input type="checkbox" name="includeSummary" checked>
+                            包含题目注释
                         </label>
                         <button type="submit">创建/打开代码文件</button>
                     </form>
@@ -1089,16 +1216,244 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private getTemplateForLanguage(language: string, problemId: number): string {
+    private async generateTemplateForLanguage(
+        language: string,
+        problemId: number,
+        includeSummary: boolean,
+    ): Promise<string> {
+        const normalizedLanguage = this.normalizeLanguage(language);
+        const payload = await this.ensureProblemData(problemId);
+        const summary = this.buildProblemSummary(problemId, payload);
+        summary.language = normalizedLanguage;
+        const summaryBlock = includeSummary
+            ? this.buildSummaryCommentBlock(normalizedLanguage, summary) ?? ''
+            : this.buildSummaryDisabledComment(normalizedLanguage);
+        const customTemplate = await this.loadCustomTemplate(normalizedLanguage, summary);
+        const body = customTemplate ?? this.getDefaultTemplateBody(normalizedLanguage);
+        const combined = `${summaryBlock}${body}`;
+        return this.ensureTrailingNewline(combined);
+    }
+
+    private async ensureProblemData(problemId: number): Promise<ProblemPayload | undefined> {
+        const cached = this.problemCache.get(problemId);
+        if (cached) {
+            return cached.data;
+        }
+        const data = await this.executeWithSession((session) =>
+            this.python.execute<{ problem: unknown }>('fetch_problem', {
+                cookies: session.cookies,
+                problem_id: problemId,
+            }),
+        );
+        const payload = this.asProblemPayload(data.problem);
+        this.cacheProblem(problemId, payload);
+        return payload;
+    }
+
+    private cacheProblem(problemId: number, payload: ProblemPayload | undefined): void {
+        this.problemCache.set(problemId, { problemId, data: payload, fetchedAt: Date.now() });
+    }
+
+    private asProblemPayload(value: unknown): ProblemPayload | undefined {
+        if (!value || typeof value !== 'object') {
+            return undefined;
+        }
+        return value as ProblemPayload;
+    }
+
+    private buildProblemSummary(problemId: number, payload: ProblemPayload | undefined): ProblemSummary {
+        const summary: ProblemSummary = { problemId: String(problemId) };
+        if (!payload) {
+            return summary;
+        }
+        if (typeof payload.problem_id === 'string' && payload.problem_id.trim()) {
+            summary.problemId = payload.problem_id.trim();
+        } else if (typeof payload.problem_id === 'number' && Number.isFinite(payload.problem_id)) {
+            summary.problemId = String(payload.problem_id);
+        }
+        if (typeof payload.title === 'string' && payload.title.trim()) {
+            summary.title = payload.title.trim();
+        }
+        if (typeof payload.url === 'string' && payload.url.trim()) {
+            summary.url = payload.url.trim();
+        }
+        if (payload.is_private) {
+            const note = typeof payload.private_message === 'string' ? payload.private_message.trim() : '';
+            summary.note = note || '该题目为私有题目，请加入对应比赛后再尝试查看题面。';
+            return summary;
+        }
+        const description = this.flattenRichText(payload.description);
+        const input = this.flattenRichText(payload.input);
+        const output = this.flattenRichText(payload.output);
+        if (description) {
+            summary.description = description;
+        }
+        if (input) {
+            summary.input = input;
+        }
+        if (output) {
+            summary.output = output;
+        }
+        return summary;
+    }
+
+    private flattenRichText(value: unknown): string {
+        if (typeof value !== 'string') {
+            return '';
+        }
+        let text = value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        text = text.replace(/\u00a0/g, ' ');
+        text = text.replace(/<\s*li\b[^>]*>/gi, '\n- ');
+        text = text.replace(/<\s*(br|hr)\s*\/?\s*>/gi, '\n');
+        text = text.replace(/<\s*\/\s*(p|div|section|article|h[1-6]|tr|thead|tbody|tfoot|table)\s*>/gi, '\n');
+        text = text.replace(/<\s*(p|div|section|article|h[1-6]|tr|thead|tbody|tfoot|table)\b[^>]*>/gi, '\n');
+        text = text.replace(/<[^>]+>/g, '');
+        text = this.decodeBasicEntities(text);
+        text = text.replace(/\n{3,}/g, '\n\n');
+        const lines = text.split('\n').map((line) => line.replace(/\s+$/u, ''));
+        const cleaned = lines.join('\n');
+        return cleaned.trim();
+    }
+
+    private decodeBasicEntities(value: string): string {
+        return value
+            .replace(/&nbsp;/gi, ' ')
+            .replace(/&lt;/gi, '<')
+            .replace(/&gt;/gi, '>')
+            .replace(/&amp;/gi, '&')
+            .replace(/&quot;/gi, '"')
+            .replace(/&#39;/g, "'");
+    }
+
+    private buildSummaryCommentBlock(language: string, summary: ProblemSummary): string | undefined {
+        const prefix = this.getCommentPrefix(language);
+        if (!prefix) {
+            return undefined;
+        }
+        const lines: string[] = [];
+        lines.push(`${prefix} ${OJAssistantProvider.PROBLEM_SUMMARY_START}`);
+        lines.push(`${prefix} 题目编号: ${summary.problemId}`);
+        if (summary.title) {
+            lines.push(`${prefix} 题目标题: ${summary.title}`);
+        }
+        if (summary.url) {
+            lines.push(`${prefix} 题目链接: ${summary.url}`);
+        }
+        const appendSection = (label: string, content?: string) => {
+            if (!content) {
+                return;
+            }
+            lines.push(`${prefix} ${label}:`);
+            for (const sectionLine of content.split('\n')) {
+                const trimmed = sectionLine.trimEnd();
+                if (trimmed) {
+                    lines.push(`${prefix}   ${trimmed}`);
+                } else {
+                    lines.push(prefix);
+                }
+            }
+        };
+        if (summary.description) {
+            appendSection('题目描述', summary.description);
+        } else if (summary.note) {
+            appendSection('题目描述', summary.note);
+        }
+        appendSection('输入描述', summary.input);
+        appendSection('输出描述', summary.output);
+        if (summary.note && summary.description) {
+            appendSection('备注', summary.note);
+        }
+        lines.push(`${prefix} ${OJAssistantProvider.PROBLEM_SUMMARY_END}`);
+        const block = lines.join('\n');
+        return `${block}\n\n`;
+    }
+
+    private buildSummaryDisabledComment(language: string): string {
+        const prefix = this.getCommentPrefix(language);
+        if (!prefix) {
+            return '';
+        }
+        return `${prefix} ${OJAssistantProvider.PROBLEM_SUMMARY_DISABLED}\n\n`;
+    }
+
+    private getCommentPrefix(language: string): string {
+        switch (language) {
+            case 'python':
+                return '#';
+            case 'cpp':
+            case 'java':
+            default:
+                return '//';
+        }
+    }
+
+    private async loadCustomTemplate(language: string, summary: ProblemSummary): Promise<string | undefined> {
+        const config = vscode.workspace.getConfiguration('ojAssistant');
+        const rawPath = config.get<string>(`templates.${language}`, '')?.trim();
+        if (!rawPath) {
+            return undefined;
+        }
+        try {
+            const templateUri = this.resolveTemplatePath(rawPath);
+            const raw = await vscode.workspace.fs.readFile(templateUri);
+            const text = Buffer.from(raw).toString('utf8').replace(/^\uFEFF/, '');
+            const populated = this.applyTemplatePlaceholders(text, summary);
+            return this.ensureTrailingNewline(populated);
+        } catch (error) {
+            void vscode.window.showErrorMessage(`读取自定义模板失败：${(error as Error).message}`);
+            return undefined;
+        }
+    }
+
+    private resolveTemplatePath(rawPath: string): vscode.Uri {
+        let candidate = rawPath;
+        if (rawPath.startsWith('~')) {
+            const homeDir = os.homedir();
+            const remainder = rawPath.slice(1).replace(/^[\\/]+/, '');
+            if (!homeDir) {
+                throw new Error('无法解析包含 ~ 的路径，因为系统未提供用户目录。');
+            }
+            candidate = remainder ? path.join(homeDir, remainder) : homeDir;
+        }
+        if (path.isAbsolute(candidate)) {
+            return vscode.Uri.file(path.normalize(candidate));
+        }
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            throw new Error('未检测到工作区，无法解析相对路径。');
+        }
+        return vscode.Uri.joinPath(workspaceFolder.uri, candidate);
+    }
+
+    private applyTemplatePlaceholders(template: string, summary: ProblemSummary): string {
+        const replacements: Record<string, string> = {
+            problemId: summary.problemId,
+            title: summary.title ?? '',
+            url: summary.url ?? '',
+            language: summary.language ?? '',
+            description: summary.description ?? '',
+            input: summary.input ?? '',
+            output: summary.output ?? '',
+            note: summary.note ?? '',
+        };
+        return template.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (match, key) => {
+            const normalizedKey = key.toLowerCase();
+            for (const [candidate, value] of Object.entries(replacements)) {
+                if (candidate.toLowerCase() === normalizedKey) {
+                    return value;
+                }
+            }
+            return '';
+        });
+    }
+
+    private getDefaultTemplateBody(language: string): string {
         const newline = '\n';
         const indentUnit = this.getIndentUnit(language);
         const indent = (level: number) => indentUnit.repeat(level);
-        const header = this.getHeaderForLanguage(language, problemId);
-
         switch (language) {
             case 'python':
                 return [
-                    header,
                     'def solve():',
                     `${indent(1)}pass`,
                     '',
@@ -1108,7 +1463,6 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 ].join(newline);
             case 'cpp':
                 return [
-                    header,
                     '#include <bits/stdc++.h>',
                     'using namespace std;',
                     '',
@@ -1122,7 +1476,6 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 ].join(newline);
             case 'java':
                 return [
-                    header,
                     'public class Main {',
                     `${indent(1)}public static void main(String[] args) throws Exception {`,
                     `${indent(1)}}`,
@@ -1130,13 +1483,60 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                     '',
                 ].join(newline);
             default:
-                return `${header}${newline}`;
+                return '';
         }
     }
 
-    private getHeaderForLanguage(language: string, problemId: number): string {
-        const prefix = language === 'python' ? '#' : '//';
-        return `${prefix} Problem ${problemId}`;
+    private ensureTrailingNewline(value: string): string {
+        if (!value) {
+            return '\n';
+        }
+        if (value.endsWith('\n')) {
+            return value;
+        }
+        if (value.endsWith('\r')) {
+            return `${value}\n`;
+        }
+        return `${value}\n`;
+    }
+
+    private prepareSourceForSubmission(_language: string, sourceCode: string): string {
+        return this.stripProblemSummary(sourceCode);
+    }
+
+    private stripProblemSummary(source: string): string {
+        if (!source) {
+            return source;
+        }
+        const usesCRLF = /\r\n/.test(source);
+        const normalized = source.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        const lines = normalized.split('\n');
+        const result: string[] = [];
+        let skipping = false;
+        for (const line of lines) {
+            if (!skipping && line.includes(OJAssistantProvider.PROBLEM_SUMMARY_START)) {
+                skipping = true;
+                continue;
+            }
+            if (skipping) {
+                if (line.includes(OJAssistantProvider.PROBLEM_SUMMARY_END)) {
+                    skipping = false;
+                }
+                continue;
+            }
+            if (line.includes('OJ-Problem-Info:')) {
+                continue;
+            }
+            result.push(line);
+        }
+        while (result.length && result[0].trim() === '') {
+            result.shift();
+        }
+        while (result.length && result[result.length - 1].trim() === '') {
+            result.pop();
+        }
+        const cleaned = result.join('\n');
+        return usesCRLF ? cleaned.replace(/\n/g, '\r\n') : cleaned;
     }
 
     private getIndentUnit(language: string): string {

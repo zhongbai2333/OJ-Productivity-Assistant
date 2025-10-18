@@ -57,10 +57,49 @@
                     "default": "javac",
                     "description": "javac 编译器命令或绝对路径，用于快速测试 Java 程序。"
                 },
+                "ojAssistant.cppCompilerPath": {
+                    "type": "string",
+                    "default": "g++",
+                    "description": "C++ 编译器命令或绝对路径，用于快速测试 C++ 程序。"
+                },
+                "ojAssistant.cppCompileArgs": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [
+                        "-std=c++17",
+                        "-O2"
+                    ],
+                    "description": "快速测试 C++ 样例时附加的编译参数，按照顺序传入编译器。"
+                },
+                "ojAssistant.cppRuntimeArgs": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [],
+                    "description": "快速测试 C++ 样例时附加的运行参数。"
+                },
                 "ojAssistant.codeDirectory": {
                     "type": "string",
                     "default": "oj-workspace",
                     "description": "自动生成代码文件时使用的相对目录。"
+                },
+                "ojAssistant.templates.python": {
+                    "type": "string",
+                    "default": "",
+                    "markdownDescription": "自定义 Python 模板文件路径，可使用相对路径（相对于工作区根目录）或绝对路径。留空使用默认模板。"
+                },
+                "ojAssistant.templates.cpp": {
+                    "type": "string",
+                    "default": "",
+                    "markdownDescription": "自定义 C++ 模板文件路径，可使用相对路径（相对于工作区根目录）或绝对路径。留空使用默认模板。"
+                },
+                "ojAssistant.templates.java": {
+                    "type": "string",
+                    "default": "",
+                    "markdownDescription": "自定义 Java 模板文件路径，可使用相对路径（相对于工作区根目录）或绝对路径。留空使用默认模板。"
                 }
             }
         }

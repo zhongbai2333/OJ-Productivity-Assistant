@@ -124,6 +124,17 @@ label {
     margin: 0;
 }
 
+.inline-checkbox {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    font-weight: 500;
+}
+
+.inline-checkbox input {
+    margin: 0;
+}
+
 input,
 select,
 button {
