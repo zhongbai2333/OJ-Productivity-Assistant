@@ -673,7 +673,9 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
     }
 
     private normalizeProgramOutput(value: string): string {
-        return value.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trimEnd();
+        let normalized = value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        normalized = normalized.replace(/\n+$/g, '');
+        return normalized;
     }
 
     private async persistPreferredLanguage(language: string): Promise<void> {

@@ -150,11 +150,11 @@ def _normalize_paragraph(value: str) -> str:
 
 def _normalize_sample(value: str) -> str:
     text = _normalize_newlines(value)
-    lines = [line.rstrip().replace("\xa0", " ") for line in text.split("\n")]
+    lines = [line.replace("\xa0", " ").rstrip("\r") for line in text.split("\n")]
     normalized: List[str] = []
     blank_pending = False
     for line in lines:
-        if line:
+        if line != "":
             normalized.append(line)
             blank_pending = False
         elif normalized and not blank_pending:
