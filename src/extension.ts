@@ -1465,11 +1465,15 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 ].join(newline);
             case 'cpp':
                 return [
-                    '#include <bits/stdc++.h>',
+                    '#include <iostream>',
+                    '#include <vector>',
+                    '#include <algorithm>',
+                    '#include <string>',
+                    '',
                     'using namespace std;',
                     '',
                     'int main() {',
-                    `${indent(1)}ios::sync_with_stdio(false);`,
+                    `${indent(1)}ios_base::sync_with_stdio(false);`,
                     `${indent(1)}cin.tie(nullptr);`,
                     '',
                     `${indent(1)}return 0;`,
