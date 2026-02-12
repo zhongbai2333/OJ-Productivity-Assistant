@@ -28,6 +28,13 @@ const state = {
     rememberPassword: true,
     hasSavedPassword: false,
     savedUserId: '',
+    contests: [],
+    contestPagination: [],
+    contestRequest: { page: 1, onlyMine: false },
+    currentContest: null,
+    contestInitialized: false,
+    activeProblemContext: null,
+    pendingContestContext: null,
     samples: {
         input: '',
         output: '',
@@ -43,6 +50,7 @@ const state = {
 };
 
 let selectedProblemRow = null;
+let selectedContestRow = null;
 
 const loginPanel = document.getElementById('login-panel');
 const loginSummary = document.getElementById('login-summary');
@@ -73,6 +81,15 @@ const toolbarOpenButton = document.getElementById('toolbar-open-file');
 const problemNavigation = document.getElementById('problem-navigation');
 const navPrevButton = document.getElementById('nav-prev-button');
 const navNextButton = document.getElementById('nav-next-button');
+const problemQuickActions = document.getElementById('problem-quick-actions');
+const quickTestButton = document.getElementById('quick-test-button');
+const quickSubmitButton = document.getElementById('quick-submit-button');
+const contestForm = document.getElementById('contest-form');
+const contestStatus = document.getElementById('contest-status');
+const contestTable = document.getElementById('contest-table');
+const contestBody = contestTable ? contestTable.querySelector('tbody') : null;
+const contestPagination = document.getElementById('contest-pagination');
+const contestDetailOutput = document.getElementById('contest-detail-output');
 
 if (languageSelect) {
     languageSelect.addEventListener('change', () => {
@@ -116,6 +133,25 @@ if (navNextButton) {
             return;
         }
         navigateToAdjacentProblem(1);
+    });
+}
+
+if (quickTestButton) {
+    quickTestButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        triggerSampleTest();
+    });
+}
+
+if (quickSubmitButton) {
+    quickSubmitButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        if (detailSubmitForm && typeof detailSubmitForm.requestSubmit === 'function') {
+            detailSubmitForm.requestSubmit();
+        } else if (detailSubmitForm) {
+            const submitEvent = new Event('submit', { bubbles: true, cancelable: true });
+            detailSubmitForm.dispatchEvent(submitEvent);
+        }
     });
 }
 
@@ -234,6 +270,61 @@ function normalizeProblemId(value) {
     return Number.isFinite(numeric) ? numeric : null;
 }
 
+function toOptionalNumber(value) {
+    if (value === null || value === undefined || value === '') {
+        return undefined;
+    }
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+function toOptionalString(value) {
+    if (value === null || value === undefined) {
+        return undefined;
+    }
+    const text = String(value).trim();
+    return text ? text : undefined;
+}
+
+function deriveContestContext(problem, fallback = null) {
+    const contestId = toOptionalString(
+        (problem && (problem.contest_id ?? problem.contestId)) || (fallback && (fallback.contest_id ?? fallback.contestId)),
+    );
+    const contestPid =
+        toOptionalNumber((problem && (problem.contest_pid ?? problem.contestPid)) ?? (fallback && fallback.contestPid)) ??
+        undefined;
+    const contestProblemId =
+        toOptionalNumber(
+            (problem && (problem.contest_problem_id ?? problem.problem_id ?? problem.contestProblemId)) ||
+                (fallback && (fallback.contestProblemId ?? fallback.problem_id)),
+        ) ?? undefined;
+    if (!contestId && contestPid === undefined && contestProblemId === undefined) {
+        return null;
+    }
+    return {
+        contestId,
+        contestPid,
+        contestProblemId,
+    };
+}
+
+function buildContestPayload() {
+    if (!state.activeProblemContext) {
+        return {};
+    }
+    const payload = {};
+    if (state.activeProblemContext.contestId) {
+        payload.contestId = state.activeProblemContext.contestId;
+    }
+    if (typeof state.activeProblemContext.contestPid === 'number') {
+        payload.contestPid = state.activeProblemContext.contestPid;
+    }
+    if (typeof state.activeProblemContext.contestProblemId === 'number') {
+        payload.contestProblemId = state.activeProblemContext.contestProblemId;
+    }
+    return payload;
+}
+
 function findProblemIndexById(problemId) {
     const numeric = normalizeProblemId(problemId);
     if (numeric === null) {
@@ -290,6 +381,38 @@ function syncProblemControls() {
         navNextButton.dataset.targetId = hasNext ? String(nextId) : '';
         navNextButton.title = hasNext ? `跳转到题目 ${nextId}` : '没有下一题';
     }
+}
+
+function syncQuickActions(options = {}) {
+    const forceHidden = Boolean(options.forceHidden);
+    const visible = !forceHidden && hasActiveProblemSelection();
+    if (problemQuickActions) {
+        problemQuickActions.classList.toggle('hidden', !visible);
+    }
+    const hasSample = Boolean(state.samples.input && state.samples.input.trim());
+    if (quickTestButton) {
+        quickTestButton.disabled = !visible || !hasSample;
+    }
+    if (quickSubmitButton) {
+        quickSubmitButton.disabled = !visible;
+    }
+}
+
+function hasActiveProblemSelection() {
+    if (typeof state.currentProblemId === 'number' && Number.isFinite(state.currentProblemId)) {
+        return true;
+    }
+    return Boolean(state.activeProblemContext);
+}
+
+function getEffectiveProblemId() {
+    if (typeof state.currentProblemId === 'number' && Number.isFinite(state.currentProblemId)) {
+        return state.currentProblemId;
+    }
+    if (state.activeProblemContext && typeof state.activeProblemContext.contestProblemId === 'number') {
+        return state.activeProblemContext.contestProblemId;
+    }
+    return null;
 }
 
 function updateSavedPasswordButton() {
@@ -409,13 +532,14 @@ function updateSampleTestAvailability() {
             btn.disabled = !hasSample;
         });
     }
+    syncQuickActions();
 }
 
 function triggerSampleTest() {
     if (!sampleTestStatus || !sampleTestOutput) {
         return;
     }
-    if (!state.currentProblemId) {
+    if (!hasActiveProblemSelection()) {
         setStatus(sampleTestStatus, '请先选择题目后再运行样例', true);
         return;
     }
@@ -437,7 +561,7 @@ function triggerSampleTest() {
     vscode.postMessage({
         type: 'runSampleTest',
         payload: {
-            problemId: state.currentProblemId,
+            problemId: getEffectiveProblemId(),
             language: state.preferredLanguage,
             filePath,
             sampleInput: state.samples.input,
@@ -539,6 +663,8 @@ function clearCurrentProblem({ notifyExtension = true } = {}) {
     state.currentProblemId = null;
     state.pendingRestore = false;
     state.samples = { input: '', output: '' };
+    state.activeProblemContext = null;
+    state.pendingContestContext = null;
     problemActions.classList.add('hidden');
     problemOutput.innerHTML = '<div class="placeholder">请选择题目以查看详情</div>';
     setStatus(fileStatus, '');
@@ -546,6 +672,7 @@ function clearCurrentProblem({ notifyExtension = true } = {}) {
     resetSampleTestUI();
     updateSampleTestAvailability();
     syncProblemControls();
+    syncQuickActions({ forceHidden: true });
 }
 
 function selectProblemById(problemId) {
@@ -559,7 +686,10 @@ function selectProblemById(problemId) {
     }
     state.pendingRestore = false;
     state.currentProblemId = normalizedId;
+    state.activeProblemContext = null;
+    state.pendingContestContext = null;
     resetSubmissionState();
+    syncQuickActions();
     if (!highlightProblemRow(normalizedId)) {
         return false;
     }
@@ -778,15 +908,17 @@ function renderProblemset(data) {
             ? `${numericAcceptance.toFixed(2)}%`
             : '-';
         const problemIdNumber = Number(problem.problem_id);
+        const pageLabel = problem.page ?? '-';
+        const statusChip = renderStatusChip(problem.is_accepted);
         row.innerHTML = `
-				<td>${problem.problem_id}</td>
-				<td>
-					<div class="title">${problem.title}</div>
-					<div class="meta">第 ${problem.page} 页 · ${renderStatusChip(problem.is_accepted)}</div>
-				</td>
-				<td>${solved} / ${submitted}</td>
-				<td>${acceptance}</td>
-			`;
+                <td>${escapeHtml(String(problem.problem_id ?? '-'))}</td>
+                <td>
+                    <div class="title">${escapeHtml(problem.title ?? '')}</div>
+                    <div class="meta">第 ${escapeHtml(String(pageLabel))} 页 · ${statusChip}</div>
+                </td>
+                <td>${escapeHtml(`${solved} / ${submitted}`)}</td>
+                <td>${escapeHtml(acceptance)}</td>
+        `;
         problemsetBody.appendChild(row);
         if (Number.isFinite(problemIdNumber) && problemIdNumber === previousId) {
             matchedRow = row;
@@ -810,6 +942,267 @@ function renderProblemset(data) {
         clearCurrentProblem({ notifyExtension: shouldNotify });
     }
     syncProblemControls();
+    syncQuickActions();
+}
+
+function renderContestPlaceholder(message, tone = 'neutral') {
+    if (!contestBody) {
+        return;
+    }
+    contestBody.innerHTML = `<tr><td colspan="3" class="placeholder${tone === 'error' ? ' error' : ''}">${escapeHtml(message)}</td></tr>`;
+}
+
+function renderContestLoading() {
+    renderContestPlaceholder('比赛列表加载中…');
+}
+
+function renderContestError(message) {
+    renderContestPlaceholder(message, 'error');
+}
+
+function updateContestForm(request) {
+    if (!contestForm) {
+        return;
+    }
+    const pageInput = contestForm.querySelector('input[name="page"]');
+    const mineCheckbox = contestForm.querySelector('input[name="onlyMine"]');
+    if (pageInput) {
+        const normalizedPage = Number(request?.page) || 1;
+        pageInput.value = String(Math.max(1, normalizedPage));
+    }
+    if (mineCheckbox) {
+        mineCheckbox.checked = Boolean(request?.onlyMine);
+    }
+}
+
+function highlightContestRow(contestId) {
+    if (!contestBody || !contestId) {
+        return;
+    }
+    const row = contestBody.querySelector(`tr[data-contest-id="${contestId}"]`);
+    if (!row) {
+        return;
+    }
+    if (selectedContestRow && selectedContestRow !== row) {
+        selectedContestRow.classList.remove('active');
+    }
+    selectedContestRow = row;
+    row.classList.add('active');
+}
+
+function renderContestPagination(items) {
+    if (!contestPagination) {
+        return;
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+        contestPagination.innerHTML = '';
+        contestPagination.classList.add('hidden');
+        return;
+    }
+    contestPagination.classList.remove('hidden');
+    contestPagination.innerHTML = items
+        .map((item) => {
+            const targetPage = Number(item.page);
+            const disabled = Boolean(item.disabled) || !Number.isFinite(targetPage);
+            const classes = ['pagination-button'];
+            if (item.active) {
+                classes.push('active');
+            }
+            if (disabled) {
+                classes.push('disabled');
+            }
+            const label = escapeHtml(item.label ?? String(item.page ?? '…'));
+            const pageAttr = disabled ? '' : ` data-page="${targetPage}"`;
+            const disabledAttr = disabled ? 'disabled' : '';
+            return `<button type="button" class="${classes.join(' ')}"${pageAttr} ${disabledAttr}>${label}</button>`;
+        })
+        .join('');
+}
+
+function renderContestList(data) {
+    if (!contestBody) {
+        return;
+    }
+    const contests = Array.isArray(data?.contests) ? data.contests : [];
+    const pagination = Array.isArray(data?.pagination) ? data.pagination : [];
+    const page = Number(data?.page) || 1;
+    const onlyMine = Boolean(data?.onlyMine);
+    state.contests = contests;
+    state.contestPagination = pagination;
+    state.contestRequest = { page, onlyMine };
+    updateContestForm(state.contestRequest);
+    contestBody.innerHTML = '';
+    if (contests.length === 0) {
+        renderContestPlaceholder('未获取到比赛数据');
+    } else {
+        for (const contest of contests) {
+            const row = document.createElement('tr');
+            const contestId = contest.contest_id ? String(contest.contest_id) : '';
+            row.dataset.contestId = contestId;
+            const visibility = contest.visibility_text ? escapeHtml(contest.visibility_text) : '';
+            const creator = contest.creator ? `出题人：${escapeHtml(contest.creator)}` : '';
+            const timeInfo = contest.time_text ? escapeHtml(contest.time_text) : '时间待定';
+            const badges = [
+                visibility ? `<span class="contest-chip small">${visibility}</span>` : '',
+                contest.status_text ? `<span class="contest-status">${escapeHtml(contest.status_text)}</span>` : '',
+            ].filter(Boolean);
+            const metaPieces = [timeInfo, creator].filter(Boolean);
+            row.innerHTML = `
+				<td class="compact-cell">
+					<div class="cell-primary">${escapeHtml(contestId || '-')}</div>
+					<div class="cell-secondary">${visibility || '公开'}</div>
+				</td>
+				<td>
+					<div class="title">
+						${escapeHtml(contest.title ?? '未命名比赛')}
+						${badges.length ? `<span class="contest-badges inline">${badges.join('')}</span>` : ''}
+					</div>
+					<div class="meta">${metaPieces.length ? metaPieces.map((entry) => `<span>${entry}</span>`).join(' · ') : '&nbsp;'}</div>
+				</td>
+				<td class="actions-cell"><button type="button" class="secondary-button contest-open" data-contest-id="${escapeHtml(
+                contestId,
+            )}">查看详情</button></td>
+			`
+            contestBody.appendChild(row);
+        }
+    }
+    renderContestPagination(pagination);
+    setStatus(contestStatus, '');
+}
+
+function renderContestDetail(contest) {
+    if (!contestDetailOutput) {
+        return;
+    }
+    if (!contest) {
+        contestDetailOutput.innerHTML = '<div class="placeholder">未获取到比赛详情</div>';
+        return;
+    }
+    state.currentContest = contest;
+    const contestId = contest.contest_id ? String(contest.contest_id) : '';
+    if (contestId) {
+        highlightContestRow(contestId);
+    }
+    const title = contest.title ?? `比赛 ${contestId || ''}`;
+    const metadata = contest.metadata ?? {};
+    const badges = Array.isArray(contest.badges) ? contest.badges : [];
+    const actions = Array.isArray(contest.actions) ? contest.actions : [];
+    const actionLinks = contest.url ? [{ label: '打开比赛页', url: contest.url }, ...actions] : actions;
+    const problems = Array.isArray(contest.problems) ? contest.problems : [];
+    const badgeHtml = badges.length
+        ? `<div class="contest-badges">${badges.map((badge) => `<span class="badge">${escapeHtml(badge)}</span>`).join('')}</div>`
+        : '';
+    const actionHtml = actionLinks.length
+        ? `<div class="contest-actions">${actionLinks
+              .map((action) => {
+                  if (!action || !action.url) {
+                      return '';
+                  }
+                  return `<a href="${escapeHtml(action.url)}" class="secondary-button" target="_blank">${escapeHtml(
+                      action.label ?? '链接',
+                  )}</a>`;
+              })
+              .filter(Boolean)
+              .join('')}</div>`
+        : '';
+    const metaEntries = [];
+    if (metadata.start_time) {
+        metaEntries.push({ label: '开始时间', value: metadata.start_time });
+    }
+    if (metadata.end_time) {
+        metaEntries.push({ label: '结束时间', value: metadata.end_time });
+    }
+    const metaHtml = metaEntries.length
+        ? `<div class="contest-meta">${metaEntries
+              .map((entry) => `
+				<div class="meta-item">
+					<span class="meta-label">${escapeHtml(entry.label)}</span>
+					<span class="meta-value">${escapeHtml(entry.value)}</span>
+				</div>`)
+              .join('')}</div>`
+        : '';
+    const problemCards = problems.length
+        ? problems
+              .map((problem) => {
+                  const letter = problem.letter ?? '-';
+                  const titleText = problem.title ?? '未命名题目';
+                  const accepted = problem.accepted ?? '-';
+                  const submissions = problem.submissions ?? '-';
+                  const contestPid = problem.contest_pid;
+                  const statsLabel = `${accepted} / ${submissions}`;
+                  const viewButton = Number.isFinite(Number(contestPid))
+                      ? `<button type="button" class="secondary-button contest-problem-load" data-contest-id="${escapeHtml(
+                            contestId,
+                        )}" data-contest-pid="${escapeHtml(String(contestPid))}">查看题面</button>`
+                      : '<span class="meta small">暂无题面</span>';
+                  return `
+				<article class="contest-problem-card">
+					<header>
+						<span class="letter">${escapeHtml(letter)}</span>
+						<span class="stat">${escapeHtml(statsLabel)}</span>
+					</header>
+					<h4>${escapeHtml(titleText)}</h4>
+					<div class="card-actions">${viewButton}</div>
+				</article>
+			`;
+              })
+              .join('')
+        : '<div class="placeholder">暂无比赛题目</div>';
+    contestDetailOutput.innerHTML = `
+		<section class="contest-head">
+			<div>
+				<h3>${escapeHtml(title)}</h3>
+				<div class="contest-meta-inline">
+					<span>比赛 ID：${escapeHtml(contestId || '-')}</span>
+				</div>
+			</div>
+			${actionHtml}
+		</section>
+        ${badgeHtml}
+        ${metaHtml}
+        <div class="contest-problem-grid">${problemCards}</div>
+	`;
+}
+
+function requestContestList(params = {}) {
+    if (!state.loggedIn) {
+        setStatus(contestStatus, '请先登录后再获取比赛列表', true);
+        return;
+    }
+    const page = Math.max(1, Number(params.page) || 1);
+    const onlyMine = Boolean(params.onlyMine);
+    state.contestRequest = { page, onlyMine };
+    renderContestLoading();
+    setStatus(contestStatus, '比赛列表加载中…');
+    vscode.postMessage({
+        type: 'fetchContests',
+        payload: { page, onlyMine },
+    });
+}
+
+function requestContestDetail(contestId) {
+    if (!state.loggedIn) {
+        setStatus(contestStatus, '请先登录后再查看比赛详情', true);
+        return;
+    }
+    if (!contestId) {
+        return;
+    }
+    if (contestDetailOutput) {
+        contestDetailOutput.innerHTML = '<div class="placeholder">比赛详情加载中…</div>';
+    }
+    vscode.postMessage({
+        type: 'fetchContestDetail',
+        payload: { contestId },
+    });
+}
+
+function ensureContestListLoaded() {
+    if (state.contestInitialized) {
+        return;
+    }
+    state.contestInitialized = true;
+    requestContestList(state.contestRequest ?? { page: 1, onlyMine: false });
 }
 
 function escapeHtml(value) {
@@ -993,13 +1386,22 @@ function renderProblemDetail(problem) {
     const numericId = Number(problem.problem_id);
     if (Number.isFinite(numericId) && !Number.isNaN(numericId)) {
         state.currentProblemId = numericId;
+    } else {
+        state.currentProblemId = null;
     }
+    const fallbackContestContext = state.pendingContestContext;
+    state.pendingContestContext = null;
     state.samples = {
         input: problem.sample_input ? String(problem.sample_input) : '',
         output: problem.sample_output ? String(problem.sample_output) : '',
     };
+    state.activeProblemContext = deriveContestContext(problem, fallbackContestContext);
+    if (state.currentProblemId === null && state.activeProblemContext?.contestProblemId !== undefined) {
+        state.currentProblemId = state.activeProblemContext.contestProblemId;
+    }
     resetSampleTestUI();
     updateSampleTestAvailability();
+    syncQuickActions({ forceHidden: Boolean(problem.is_private) });
     if (problem.is_private) {
         const problemIdLabel = problem.problem_id ?? '-';
         const displayTitle = problem.raw_title || problem.title || `题目 ${problemIdLabel}`;
@@ -1107,6 +1509,13 @@ function renderProblemDetail(problem) {
     const tags = Array.isArray(problem.tags) ? problem.tags : [];
     const problemTitle = problem.raw_title || `${problem.problem_id ?? ''} ${problem.title ?? ''}`;
     const problemUrl = problem.url ? `<a href="${escapeHtml(problem.url)}" target="_blank">查看原题</a>` : '<span>无原题链接</span>';
+    const contestMeta = state.activeProblemContext
+        ? `<span class="contest-chip">比赛 ${escapeHtml(state.activeProblemContext.contestId ?? '-')}${
+              typeof state.activeProblemContext.contestPid === 'number'
+                  ? ` · 题号 ${state.activeProblemContext.contestPid}`
+                  : ''
+          }</span>`
+        : '';
 
     const headerHtml = `
 			<div class="problem-header">
@@ -1114,6 +1523,7 @@ function renderProblemDetail(problem) {
 				<div class="problem-meta">
 					<span>编号：${escapeHtml(String(problem.problem_id))}</span>
 					<span>来源：${problemUrl}</span>
+					${contestMeta}
 				</div>
 			</div>
 		`;
@@ -1148,11 +1558,12 @@ function renderProblemDetail(problem) {
     if (state.currentProblemId !== null) {
         highlightProblemRow(state.currentProblemId);
     }
-    problemActions.classList.toggle('hidden', state.currentProblemId === null);
+    problemActions.classList.toggle('hidden', !hasActiveProblemSelection());
     setStatus(fileStatus, '');
     renderSubmissionState();
     state.pendingRestore = false;
     syncProblemControls();
+    syncQuickActions({ forceHidden: Boolean(problem.is_private) });
 }
 
 function renderStatusTable(entries) {
@@ -1260,10 +1671,66 @@ problemsetBody.addEventListener('click', (event) => {
     selectProblemById(problemId);
 });
 
+if (contestForm) {
+    contestForm.addEventListener('submit', (event) => {
+        event.preventDefault();
+        const formData = new FormData(contestForm);
+        const page = Number(formData.get('page') || 1);
+        const onlyMine = formData.get('onlyMine') === 'on';
+        requestContestList({ page, onlyMine });
+    });
+}
+
+if (contestBody) {
+    contestBody.addEventListener('click', (event) => {
+        const button = event.target.closest('.contest-open');
+        const row = event.target.closest('tr[data-contest-id]');
+        const contestId = (button ?? row)?.dataset.contestId;
+        if (!contestId) {
+            return;
+        }
+        requestContestDetail(contestId);
+    });
+}
+
+if (contestPagination) {
+    contestPagination.addEventListener('click', (event) => {
+        const button = event.target.closest('button[data-page]');
+        if (!button || button.disabled) {
+            return;
+        }
+        const targetPage = Number(button.dataset.page);
+        if (!Number.isFinite(targetPage)) {
+            return;
+        }
+        requestContestList({ page: targetPage, onlyMine: state.contestRequest?.onlyMine ?? false });
+    });
+}
+
+if (contestDetailOutput) {
+    contestDetailOutput.addEventListener('click', (event) => {
+        const button = event.target.closest('.contest-problem-load');
+        if (!button) {
+            return;
+        }
+        const contestId = button.dataset.contestId;
+        const contestPid = Number(button.dataset.contestPid);
+        if (!contestId || !Number.isFinite(contestPid)) {
+            return;
+        }
+        state.pendingContestContext = { contestId, contestPid };
+        vscode.postMessage({
+            type: 'fetchContestProblem',
+            payload: { contestId, contestPid },
+        });
+    });
+}
+
 detailFileForm.addEventListener('submit', (event) => {
     event.preventDefault();
-    if (!state.currentProblemId) {
-        setStatus(fileStatus, '请先选择题目', true);
+    const problemId = getEffectiveProblemId();
+    if (problemId === null) {
+        setStatus(fileStatus, '当前题目缺少编号，暂无法创建模板', true);
         return;
     }
     const formData = new FormData(detailFileForm);
@@ -1272,14 +1739,15 @@ detailFileForm.addEventListener('submit', (event) => {
     setStatus(fileStatus, '处理中…');
     vscode.postMessage({
         type: 'createFile',
-        payload: { problemId: state.currentProblemId, language, includeSummary },
+        payload: { problemId, language, includeSummary, ...buildContestPayload() },
     });
 });
 
 detailSubmitForm.addEventListener('submit', (event) => {
     event.preventDefault();
-    if (!state.currentProblemId) {
-        renderSubmissionError('请先选择题目再进行提交');
+    const problemId = getEffectiveProblemId();
+    if (problemId === null) {
+        renderSubmissionError('当前题目缺少编号，暂无法提交');
         return;
     }
     const formData = new FormData(detailSubmitForm);
@@ -1294,7 +1762,7 @@ detailSubmitForm.addEventListener('submit', (event) => {
     renderSubmissionLoading();
     vscode.postMessage({
         type: 'submitSolution',
-        payload: { problemId: state.currentProblemId, language, filePath },
+        payload: { problemId, language, filePath, ...buildContestPayload() },
     });
 });
 
@@ -1361,6 +1829,7 @@ window.addEventListener('message', (event) => {
             collapseLoginPanel(message.userId, false);
             clearCurrentProblem({ notifyExtension: false });
             resetSampleTestUI();
+            ensureContestListLoaded();
             break;
         case 'sessionRestored':
             state.loggedIn = true;
@@ -1413,9 +1882,16 @@ window.addEventListener('message', (event) => {
                 highlightProblemRow(state.currentProblemId);
             }
             resetSampleTestUI();
+            ensureContestListLoaded();
             break;
         case 'problemset':
             renderProblemset(message.payload);
+            break;
+        case 'contests':
+            renderContestList(message.payload);
+            break;
+        case 'contestDetail':
+            renderContestDetail(message.payload);
             break;
         case 'problem':
             renderProblemDetail(message.payload);
@@ -1458,6 +1934,19 @@ window.addEventListener('message', (event) => {
                 expandLoginPanel();
             } else if (message.context === 'createFile') {
                 setStatus(fileStatus, message.message, true);
+            } else if (message.context === 'fetchContests') {
+                setStatus(contestStatus, message.message, true);
+                renderContestError(message.message ?? '比赛列表加载失败');
+            } else if (message.context === 'fetchContestDetail') {
+                setStatus(contestStatus, message.message, true);
+                if (contestDetailOutput) {
+                    contestDetailOutput.innerHTML = `<div class="placeholder error">${escapeHtml(
+                        message.message ?? '比赛详情加载失败',
+                    )}</div>`;
+                }
+            } else if (message.context === 'fetchContestProblem') {
+                state.pendingContestContext = null;
+                setStatus(fileStatus, message.message, true);
             } else {
                 state.submission.loading = false;
                 state.submission.error = message.message;
@@ -1466,6 +1955,7 @@ window.addEventListener('message', (event) => {
             break;
         case 'savedCredentials':
             state.loggedIn = false;
+            state.contestInitialized = false;
             state.rememberPassword = message.rememberPassword !== false;
             state.hasSavedPassword = Boolean(message.hasSavedPassword);
             state.savedUserId = state.hasSavedPassword ? (message.userId ?? '') : '';

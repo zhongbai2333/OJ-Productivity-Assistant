@@ -333,6 +333,167 @@ def fetch_problemset(session, start_page=1, max_pages=None):
     return results
 
 
+def _extract_query_param(href: str, key: str) -> Optional[int]:
+    full_url = urljoin(BASE_URL, href)
+    query = urlparse(full_url).query
+    values = parse_qs(query).get(key)
+    if not values:
+        return None
+    try:
+        return int(values[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_contests(session, page=1, only_mine=False):
+    query_params = {"page": max(1, int(page))}
+    if only_mine:
+        query_params["my"] = "1"
+    contest_url = urljoin(BASE_URL, "contest.php")
+    response = session.get(contest_url, params=query_params, timeout=10)
+    response.raise_for_status()
+
+    soup = bs4.BeautifulSoup(response.text, "html.parser")
+    _ensure_authenticated(response, soup)
+
+    table = soup.select_one("table.ui.very.basic.center.aligned.table")
+    contests: List[Dict[str, Any]] = []
+    if table is not None:
+        tbody = table.find("tbody") or table
+        for row in tbody.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) < 5:
+                continue
+            contest_id = cells[0].get_text(strip=True)
+            title_cell = cells[1]
+            title_link = title_cell.find("a", href=True)
+            title = title_cell.get_text(strip=True)
+            contest_href = title_link["href"] if title_link else None
+            contest_link = urljoin(contest_url, contest_href) if contest_href else None
+
+            time_cell = cells[2]
+            time_text = time_cell.get_text(" ", strip=True)
+            status_span = time_cell.find("span", class_="text-danger") or time_cell.find(
+                "span", class_="text-muted"
+            )
+            status_text = status_span.get_text(strip=True) if status_span else None
+
+            visibility_text = cells[3].get_text(strip=True)
+            creator_text = cells[4].get_text(strip=True)
+
+            contests.append(
+                {
+                    "contest_id": contest_id.strip(),
+                    "title": title,
+                    "status_text": status_text,
+                    "time_text": time_text,
+                    "visibility_text": visibility_text,
+                    "creator": creator_text,
+                    "url": contest_link,
+                }
+            )
+
+    pagination_links: List[Dict[str, Optional[int]]] = []
+    for link in soup.select(".ui.pagination.menu a.item"):
+        href = link.get("href") or ""
+        page_number = _extract_page_number(href)
+        pagination_links.append(
+            {
+                "label": link.get_text(strip=True),
+                "page": page_number,
+                "active": "active" in link.get("class", []),
+                "disabled": "disabled" in link.get("class", []),
+            }
+        )
+
+    return {
+        "page": max(1, int(page)),
+        "contests": contests,
+        "pagination": pagination_links,
+        "onlyMine": only_mine,
+    }
+
+
+def fetch_contest_detail(session, contest_id):
+    contest_url = urljoin(BASE_URL, f"contest.php?cid={contest_id}")
+    response = session.get(contest_url, timeout=10)
+    response.raise_for_status()
+
+    soup = bs4.BeautifulSoup(response.text, "html.parser")
+    _ensure_authenticated(response, soup)
+
+    container = soup.select_one("div.padding")
+    title_elem = container.find("h1") if container else soup.find("h1")
+    title = title_elem.get_text(strip=True) if title_elem else f"Contest {contest_id}"
+
+    start_label = container.select_one(".ui.pointing.below.left.label") if container else None
+    end_label = container.select_one(".ui.pointing.below.right.label") if container else None
+
+    metadata = {
+        "start_time": start_label.get_text(strip=True) if start_label else None,
+        "end_time": end_label.get_text(strip=True) if end_label else None,
+    }
+
+    badge_container = container.select_one(".ui.buttons.right.floated") if container else None
+    badges = []
+    if badge_container is not None:
+        for badge in badge_container.select(".ui.small.button"):
+            badges.append(badge.get_text(strip=True))
+
+    action_buttons = []
+    button_bar = container.select_one(".ui.buttons") if container else None
+    if button_bar is not None:
+        for btn in button_bar.select("a.ui.button"):
+            action_buttons.append(
+                {
+                    "label": btn.get_text(strip=True),
+                    "url": urljoin(contest_url, btn.get("href")),
+                }
+            )
+
+    problems: List[Dict[str, Any]] = []
+    problem_table = soup.select_one("table.ui.selectable.celled.table")
+    if problem_table is not None:
+        tbody = problem_table.find("tbody") or problem_table
+        for row in tbody.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) < 5:
+                continue
+            letter_cell = cells[1]
+            title_cell = cells[2]
+            letter_link = letter_cell.find("a", href=True)
+            title_link = title_cell.find("a", href=True)
+            href = None
+            pid = None
+            if letter_link and letter_link.get("href"):
+                href = letter_link.get("href")
+                pid = _extract_query_param(href, "pid")
+            elif title_link and title_link.get("href"):
+                href = title_link.get("href")
+                pid = _extract_query_param(href, "pid")
+
+            problems.append(
+                {
+                    "letter": letter_cell.get_text(strip=True),
+                    "title": title_cell.get_text(strip=True),
+                    "accepted": cells[3].get_text(strip=True),
+                    "submissions": cells[4].get_text(strip=True),
+                    "contest_pid": pid,
+                    "url": urljoin(contest_url, href) if href else None,
+                }
+            )
+
+    return {
+        "contest_id": str(contest_id),
+        "title": title,
+        "metadata": metadata,
+        "badges": badges,
+        "actions": action_buttons,
+        "problems": problems,
+        "url": contest_url,
+    }
+
+
 def _collect_labels(soup: bs4.BeautifulSoup) -> Dict[str, str]:
     metadata: Dict[str, str] = {}
     for span in soup.select("div.padding span.ui.label"):
@@ -560,12 +721,30 @@ def _extract_problem_header(soup: bs4.BeautifulSoup) -> Dict[str, Optional[str]]
     return {"problem_id": problem_id, "title": problem_title, "raw_title": raw_title}
 
 
-def fetch_problem(session, problem_id):
-    problem_url = urljoin(BASE_URL, f"problem.php?id={problem_id}")
+def fetch_problem(session, problem_id=None, contest_id=None, contest_pid=None):
+    if contest_id is not None and contest_pid is not None:
+        problem_url = urljoin(BASE_URL, f"problem.php?cid={contest_id}&pid={contest_pid}")
+        context = {"contest_id": str(contest_id), "contest_pid": str(contest_pid)}
+    elif problem_id is not None:
+        problem_url = urljoin(BASE_URL, f"problem.php?id={problem_id}")
+        context = None
+    else:
+        raise ValueError("problem_id or contest information is required")
+
     response = session.get(problem_url, timeout=10)
     response.raise_for_status()
 
     soup = bs4.BeautifulSoup(response.text, "html.parser")
+    return _parse_problem_page(session, soup, problem_url, context, fallback_problem_id=problem_id)
+
+
+def _parse_problem_page(
+    session,
+    soup: bs4.BeautifulSoup,
+    problem_url: str,
+    contest_context: Optional[Dict[str, str]] = None,
+    fallback_problem_id: Optional[int] = None,
+) -> Dict[str, Any]:
     private_notice = soup.select_one("div.ui.negative.icon.message")
     if private_notice is not None:
         sanitized_notice = _sanitize_rich_content(str(private_notice))
@@ -583,8 +762,8 @@ def fetch_problem(session, problem_id):
                     "url": urljoin(problem_url, href),
                 }
             )
-        return {
-            "problem_id": str(problem_id),
+        payload = {
+            "problem_id": str(fallback_problem_id) if fallback_problem_id is not None else None,
             "title": None,
             "raw_title": None,
             "metadata": {},
@@ -604,6 +783,16 @@ def fetch_problem(session, problem_id):
             "private_message": message_text,
             "private_contests": contest_links,
         }
+        if contest_context:
+            payload.update(
+                {
+                    "contest_id": contest_context.get("contest_id"),
+                    "contest_pid": contest_context.get("contest_pid"),
+                    "is_contest_problem": True,
+                }
+            )
+        return payload
+
     _absolutize_resources(soup, problem_url)
     _embed_protected_images(soup, session, problem_url)
 
@@ -650,8 +839,12 @@ def fetch_problem(session, problem_id):
         "<img" in value.lower() for value in sections.values() if value
     )
 
-    problem_data = {
-        "problem_id": header_info.get("problem_id") or str(problem_id),
+    problem_identifier = header_info.get("problem_id") or (
+        str(fallback_problem_id) if fallback_problem_id is not None else None
+    )
+
+    problem_data: Dict[str, Any] = {
+        "problem_id": problem_identifier,
         "title": header_info.get("title"),
         "metadata": metadata,
         "description": _clean_value("description", _get_section_value("description")),
@@ -669,7 +862,19 @@ def fetch_problem(session, problem_id):
         "raw_sections": raw_sections,
         "url": problem_url,
         "hasExternalResources": has_external_resources,
+        "is_private": False,
     }
+
+    if contest_context:
+        problem_data.update(
+            {
+                "contest_id": contest_context.get("contest_id"),
+                "contest_pid": contest_context.get("contest_pid"),
+                "is_contest_problem": True,
+            }
+        )
+    else:
+        problem_data["is_contest_problem"] = False
 
     return problem_data
 
@@ -823,9 +1028,22 @@ def _status_entry_sort_key(entry: Dict[str, Optional[str]]) -> Tuple[int, str]:
 
 
 def _prepare_submit_payload(
-    session, problem_id, language, source_code, contest_problem_id
+    session,
+    problem_id,
+    language,
+    source_code,
+    contest_problem_id,
+    contest_id=None,
+    contest_pid=None,
 ):
-    submit_page_url = urljoin(BASE_URL, f"submitpage.php?id={problem_id}")
+    if contest_id is not None and contest_pid is not None:
+        submit_page_url = urljoin(
+            BASE_URL, f"submitpage.php?cid={contest_id}&pid={contest_pid}"
+        )
+    elif problem_id is not None:
+        submit_page_url = urljoin(BASE_URL, f"submitpage.php?id={problem_id}")
+    else:
+        raise ValueError("problem_id or contest information is required for submission")
     response = session.get(submit_page_url, timeout=10)
     response.raise_for_status()
 
@@ -861,28 +1079,48 @@ def _prepare_submit_payload(
         option = select.find("option", selected=True) or select.find("option")
         payload[name] = option.get("value", "") if option else ""
 
-    payload["id"] = str(problem_id)
+    if problem_id is not None and "id" not in payload:
+        payload["id"] = str(problem_id)
     payload["language"] = str(language)
     payload["source"] = source_code
 
-    if contest_problem_id is not None:
+    if contest_problem_id is not None and "problem_id" not in payload:
         payload["problem_id"] = str(contest_problem_id)
 
-    return payload
+    if contest_id is not None and "cid" not in payload:
+        payload["cid"] = str(contest_id)
+
+    if contest_pid is not None and "pid" not in payload:
+        payload["pid"] = str(contest_pid)
+
+    return payload, submit_page_url
 
 
 def submit_solution(
-    session, user_id, problem_id, source_code, language=6, contest_problem_id=0
+    session,
+    user_id,
+    problem_id,
+    source_code,
+    language=6,
+    contest_problem_id=0,
+    contest_id=None,
+    contest_pid=None,
 ):
     pre_entries = fetch_status_list(session, user_id, limit=20)
     seen_keys = {_status_entry_key(entry) for entry in pre_entries}
 
-    payload = _prepare_submit_payload(
-        session, problem_id, language, source_code, contest_problem_id
+    payload, submit_page_url = _prepare_submit_payload(
+        session,
+        problem_id,
+        language,
+        source_code,
+        contest_problem_id,
+        contest_id,
+        contest_pid,
     )
 
     submit_url = urljoin(BASE_URL, "submit.php")
-    headers = {"Referer": urljoin(BASE_URL, f"submitpage.php?id={problem_id}")}
+    headers = {"Referer": submit_page_url}
     response = session.post(submit_url, data=payload, timeout=10, headers=headers)
     response.raise_for_status()
 
@@ -1013,11 +1251,46 @@ def _handle_action(request: Dict[str, Any]) -> Dict[str, Any]:
             )
         }
 
+    if action == "fetch_contests":
+        page = request.get("page", 1)
+        only_mine = bool(request.get("only_mine"))
+        return {
+            "contests": fetch_contests(session, page=page, only_mine=only_mine)
+        }
+
+    if action == "fetch_contest_detail":
+        contest_id = request.get("contest_id")
+        if contest_id is None:
+            raise ValueError("contest_id is required")
+        return {"contest": fetch_contest_detail(session, contest_id=contest_id)}
+
     if action == "fetch_problem":
         problem_id = request.get("problem_id")
-        if problem_id is None:
-            raise ValueError("problem_id is required")
-        return {"problem": fetch_problem(session, problem_id=problem_id)}
+        contest_id = request.get("contest_id")
+        contest_pid = request.get("contest_pid")
+        if problem_id is None and (contest_id is None or contest_pid is None):
+            raise ValueError("problem_id or contest information is required")
+        return {
+            "problem": fetch_problem(
+                session,
+                problem_id=problem_id,
+                contest_id=contest_id,
+                contest_pid=contest_pid,
+            )
+        }
+
+    if action == "fetch_contest_problem":
+        contest_id = request.get("contest_id")
+        contest_pid = request.get("contest_pid")
+        if contest_id is None or contest_pid is None:
+            raise ValueError("contest_id and contest_pid are required")
+        return {
+            "problem": fetch_problem(
+                session,
+                contest_id=contest_id,
+                contest_pid=contest_pid,
+            )
+        }
 
     if action == "fetch_status":
         user_id = request.get("user_id")
@@ -1032,6 +1305,8 @@ def _handle_action(request: Dict[str, Any]) -> Dict[str, Any]:
         source_code = request.get("source_code")
         language = request.get("language", 6)
         contest_problem_id = request.get("contest_problem_id", 0)
+        contest_id = request.get("contest_id")
+        contest_pid = request.get("contest_pid")
         if not user_id or problem_id is None or source_code is None:
             raise ValueError(
                 "user_id, problem_id, and source_code are required for submission"
@@ -1043,6 +1318,8 @@ def _handle_action(request: Dict[str, Any]) -> Dict[str, Any]:
             source_code=source_code,
             language=language,
             contest_problem_id=contest_problem_id,
+            contest_id=contest_id,
+            contest_pid=contest_pid,
         )
         return {"submission": submission}
 

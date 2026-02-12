@@ -25,7 +25,7 @@ main {
     display: grid;
     gap: 16px;
     padding: 16px;
-    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
 }
 
 .card {
@@ -252,6 +252,37 @@ tbody tr.active {
     box-shadow: inset 2px 0 0 0 var(--vscode-focusBorder, rgba(78, 201, 176, 0.9));
 }
 
+.compact-cell {
+    width: 120px;
+    white-space: nowrap;
+}
+
+.compact-cell .cell-primary {
+    font-weight: 600;
+}
+
+.compact-cell .cell-secondary {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.8rem;
+}
+
+.actions-cell {
+    width: 120px;
+    text-align: right;
+}
+
+.meta.compact {
+    font-size: 0.8rem;
+    color: var(--vscode-descriptionForeground);
+}
+
+.contest-badges.inline {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-left: 8px;
+}
+
 .status-chip {
     display: inline-flex;
     align-items: center;
@@ -305,6 +336,18 @@ th.placeholder {
     margin-bottom: 8px;
 }
 
+.quick-actions {
+    margin-bottom: 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.quick-actions button {
+    flex: 1 1 160px;
+    white-space: nowrap;
+}
+
 .problem-navigation {
     display: flex;
     gap: 12px;
@@ -347,6 +390,13 @@ th.placeholder {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: 8px 12px;
+    margin-top: 12px;
+}
+
+.contest-meta {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
     margin-top: 12px;
 }
 
@@ -547,4 +597,177 @@ th.placeholder {
     background: rgba(78, 201, 176, 0.15);
     color: var(--vscode-foreground);
     font-size: 0.8rem;
+}
+
+.pagination {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.pagination.hidden {
+    display: none;
+}
+
+.pagination-button {
+    border: 1px solid var(--vscode-editorWidget-border);
+    background: transparent;
+    color: var(--vscode-foreground);
+    padding: 4px 10px;
+    border-radius: 999px;
+    cursor: pointer;
+}
+
+.pagination-button:hover:not(.disabled) {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.pagination-button.active {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+}
+
+.pagination-button.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.contest-detail-output {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.contest-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: center;
+}
+
+.contest-head h2 {
+    margin: 0;
+}
+
+.contest-meta-inline {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9rem;
+    margin-top: 4px;
+}
+
+.contest-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.contest-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.contest-problem-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 12px;
+}
+
+.contest-problem-card {
+    border: 1px solid var(--vscode-editorWidget-border);
+    border-radius: 8px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    cursor: pointer;
+}
+
+.contest-problem-card:hover {
+    background: rgba(78, 201, 176, 0.08);
+}
+
+.contest-problem-card header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.9rem;
+    color: var(--vscode-descriptionForeground);
+}
+
+.contest-problem-card .letter {
+    font-weight: 700;
+    font-size: 1.1rem;
+    color: var(--vscode-foreground);
+}
+
+.contest-problem-card .stat {
+    font-weight: 600;
+}
+
+.contest-problem-card h4 {
+    margin: 0;
+    font-size: 1rem;
+}
+
+.contest-problem-card .card-actions {
+    display: flex;
+    justify-content: flex-end;
+}
+
+.contest-empty {
+    padding: 12px;
+    text-align: center;
+    color: var(--vscode-descriptionForeground);
+}
+
+.badge {
+    padding: 2px 10px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    font-size: 0.8rem;
+}
+
+.contest-problem-table table {
+    width: 100%;
+    border-collapse: collapse;
+    border: 1px solid var(--vscode-editorWidget-border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.contest-problem-table th,
+.contest-problem-table td {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--vscode-editorWidget-border);
+    text-align: left;
+}
+
+.contest-problem-table thead {
+    background: var(--vscode-tab-activeBackground, rgba(255, 255, 255, 0.04));
+}
+
+.contest-problem-table tbody tr:hover {
+    background: rgba(78, 201, 176, 0.08);
+}
+
+.contest-chip {
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: rgba(33, 150, 243, 0.2);
+    color: var(--vscode-foreground);
+    font-size: 0.8rem;
+}
+
+.contest-chip.small {
+    font-size: 0.75rem;
+}
+
+.contest-status {
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    font-size: 0.75rem;
 }

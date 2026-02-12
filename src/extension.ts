@@ -23,8 +23,10 @@ interface PersistedSession {
     rememberPassword: boolean;
     passwordHash?: string;
     currentProblemId?: number;
+    currentContest?: { contestId?: string; contestPid?: number };
     problemset?: PersistedProblemsetState;
     lastProblem?: PersistedProblemState;
+    lastContestDetail?: { contestId: string; data: unknown; fetchedAt: number };
     preferredLanguage?: string;
     includeSummaryInTemplate?: boolean;
 }
@@ -38,9 +40,32 @@ type WebviewMessage =
     | { type: 'login'; payload: { username: string; password: string; remember: boolean; useSavedPassword?: boolean } }
     | { type: 'fetchProblemset'; payload: { startPage: number; maxPages?: number | null } }
     | { type: 'fetchProblem'; payload: { problemId: number } }
+    | { type: 'fetchContests'; payload: { page: number; onlyMine?: boolean } }
+    | { type: 'fetchContestDetail'; payload: { contestId: string } }
+    | { type: 'fetchContestProblem'; payload: { contestId: string; contestPid: number } }
     | { type: 'fetchStatus'; payload: { limit: number } }
-    | { type: 'createFile'; payload: { problemId: number; language: string; includeSummary?: boolean } }
-    | { type: 'submitSolution'; payload: { problemId: number; language: string; filePath: string; contestProblemId?: number | null } }
+    | {
+          type: 'createFile';
+          payload: {
+              problemId: number;
+              language: string;
+              includeSummary?: boolean;
+              contestId?: string | number | null;
+              contestPid?: number | string | null;
+              contestProblemId?: number | string | null;
+          };
+      }
+    | {
+          type: 'submitSolution';
+          payload: {
+              problemId: number;
+              language: string;
+              filePath: string;
+              contestProblemId?: number | string | null;
+              contestId?: string | number | null;
+              contestPid?: number | string | null;
+          };
+      }
     | { type: 'selectProblem'; payload: { problemId: number | null } }
     | { type: 'runSampleTest'; payload: { problemId: number | null; language: string; filePath: string; sampleInput: string; expectedOutput?: string | null } }
     | { type: 'updateProblemStatus'; payload: { problemId: number; accepted: boolean } }
@@ -58,13 +83,24 @@ interface ProblemPayload {
     private_message?: string | null;
     sample_input?: string | null;
     sample_output?: string | null;
+    contest_id?: string | number | null;
+    contest_pid?: string | number | null;
+    contest_problem_id?: string | number | null;
+    is_contest_problem?: boolean;
     [key: string]: unknown;
+}
+
+interface ContestProblemContext {
+    contestId?: string;
+    contestPid?: number;
+    contestProblemId?: number;
 }
 
 interface ProblemCacheEntry {
     readonly problemId: number;
     readonly data: ProblemPayload | undefined;
     readonly fetchedAt: number;
+    readonly contestContext?: ContestProblemContext;
 }
 
 interface ProblemSummary {
@@ -101,6 +137,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
     private readonly python: PythonService;
     private session: SessionState | undefined;
     private currentProblemId: number | null = null;
+    private currentContestContext: ContestProblemContext | undefined;
     private sessionRestorePromise: Promise<void> | undefined;
     private savedCredentials: { userId: string; passwordHash?: string; rememberPassword: boolean } | undefined;
     private autoLoginPromise: Promise<boolean> | undefined;
@@ -154,6 +191,15 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 case 'fetchProblem':
                     await this.handleFetchProblem(message.payload.problemId);
                     break;
+                case 'fetchContests':
+                    await this.handleFetchContests(message.payload.page, message.payload.onlyMine ?? false);
+                    break;
+                case 'fetchContestDetail':
+                    await this.handleFetchContestDetail(message.payload.contestId);
+                    break;
+                case 'fetchContestProblem':
+                    await this.handleFetchContestProblem(message.payload.contestId, message.payload.contestPid);
+                    break;
                 case 'fetchStatus':
                     await this.handleFetchStatus(message.payload.limit);
                     break;
@@ -169,7 +215,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                         message.payload.problemId,
                         message.payload.language,
                         message.payload.filePath,
-                        message.payload.contestProblemId ?? undefined,
+                        this.normalizeContestContext(message.payload),
                     );
                     break;
                 case 'selectProblem':
@@ -272,6 +318,7 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
 
     private async handleFetchProblem(problemId: number): Promise<void> {
         this.currentProblemId = problemId;
+        this.currentContestContext = undefined;
         const data = await this.executeWithSession((session) =>
             this.python.execute<{ problem: unknown }>('fetch_problem', {
                 cookies: session.cookies,
@@ -279,20 +326,74 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
             }),
         );
         const problemPayload = this.asProblemPayload(data.problem);
-        this.cacheProblem(problemId, problemPayload);
+        const contestContext = problemPayload?.is_contest_problem
+            ? this.deriveContestContextFromProblem(problemPayload)
+            : undefined;
+        this.currentContestContext = contestContext;
+        this.cacheProblem(problemId, problemPayload, contestContext);
         this.postMessage({ type: 'problem', payload: data.problem });
-        await this.mutatePersistedSession((persisted) => {
-            persisted.currentProblemId = problemId;
-            if (data.problem !== undefined) {
-                persisted.lastProblem = {
-                    problemId,
-                    data: data.problem,
-                    fetchedAt: Date.now(),
-                };
-            } else {
-                delete persisted.lastProblem;
-            }
+        await this.persistFetchedProblem(problemId, data.problem);
+    }
+
+    private async handleFetchContests(page: number, onlyMine: boolean): Promise<void> {
+        const normalizedPage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
+        const data = await this.executeWithSession((session) =>
+            this.python.execute<{ contests: unknown }>('fetch_contests', {
+                cookies: session.cookies,
+                page: normalizedPage,
+                only_mine: onlyMine,
+            }),
+        );
+        this.postMessage({ type: 'contests', payload: data.contests });
+    }
+
+    private async handleFetchContestDetail(contestIdRaw: string): Promise<void> {
+        const contestId = this.toOptionalString(contestIdRaw);
+        if (!contestId) {
+            throw new Error('contestId 无效');
+        }
+        const data = await this.executeWithSession((session) =>
+            this.python.execute<{ contest: unknown }>('fetch_contest_detail', {
+                cookies: session.cookies,
+                contest_id: contestId,
+            }),
+        );
+        this.postMessage({ type: 'contestDetail', payload: data.contest });
+    }
+
+    private async handleFetchContestProblem(contestIdRaw: string, contestPidRaw: number): Promise<void> {
+        const contestId = this.toOptionalString(contestIdRaw);
+        const contestPid = this.toOptionalNumber(contestPidRaw);
+        if (!contestId || contestPid === undefined) {
+            throw new Error('contestId 或 contestPid 无效');
+        }
+        const data = await this.executeWithSession((session) =>
+            this.python.execute<{ problem: unknown }>('fetch_contest_problem', {
+                cookies: session.cookies,
+                contest_id: contestId,
+                contest_pid: contestPid,
+            }),
+        );
+        const payload = this.asProblemPayload(data.problem);
+        const numericProblemId = this.extractProblemIdFromPayload(payload);
+        if (typeof numericProblemId === 'number') {
+            this.currentProblemId = numericProblemId;
+        } else {
+            this.currentProblemId = null;
+        }
+        const contestContext = this.normalizeContestContext({
+            contestId,
+            contestPid,
+            contestProblemId: payload?.contest_problem_id ?? payload?.problem_id,
         });
+        this.currentContestContext = contestContext;
+        if (typeof numericProblemId === 'number') {
+            this.cacheProblem(numericProblemId, payload, contestContext);
+        }
+        this.postMessage({ type: 'problem', payload: data.problem });
+        if (typeof numericProblemId === 'number') {
+            await this.persistFetchedProblem(numericProblemId, data.problem);
+        }
     }
 
     private async handleFetchStatus(limit: number): Promise<void> {
@@ -348,7 +449,12 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         await this.persistPreferredLanguage(language);
     }
 
-    private async handleSubmitSolution(problemId: number, language: string, filePath: string, contestProblemId?: number): Promise<void> {
+    private async handleSubmitSolution(
+        problemId: number,
+        language: string,
+        filePath: string,
+        contestContext?: ContestProblemContext,
+    ): Promise<void> {
         await this.withAutoRelogin(async () => {
             const session = await this.ensureSession();
             const languageCode = this.getLanguageCode(language);
@@ -356,6 +462,10 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
             const sourceBuffer = await vscode.workspace.fs.readFile(fileUri);
             const sourceCode = Buffer.from(sourceBuffer).toString('utf8');
             const preparedSource = this.prepareSourceForSubmission(language, sourceCode);
+            const effectiveContext = contestContext ?? this.currentContestContext;
+            const contestProblemId = effectiveContext?.contestProblemId;
+            const contestPid = effectiveContext?.contestPid;
+            const contestId = effectiveContext?.contestId;
 
             const submission = await this.python.execute<{ submission: { solution_id?: number } }>('submit_solution', {
                 cookies: session.cookies,
@@ -364,6 +474,8 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 source_code: preparedSource,
                 language: languageCode,
                 contest_problem_id: contestProblemId ?? 0,
+                contest_id: contestId,
+                contest_pid: contestPid,
             });
 
             this.postMessage({ type: 'submission', payload: submission.submission });
@@ -714,6 +826,12 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
 
     private async handleSelectProblem(problemId: number | null): Promise<void> {
         this.currentProblemId = typeof problemId === 'number' ? problemId : null;
+        if (this.currentProblemId !== null) {
+            const cached = this.problemCache.get(this.currentProblemId);
+            this.currentContestContext = cached?.contestContext;
+        } else {
+            this.currentContestContext = undefined;
+        }
         if (!this.session) {
             return;
         }
@@ -1084,9 +1202,52 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
                 </table>
             </div>
         </section>
+        <section class="card" id="contest-list">
+            <h2>比赛列表</h2>
+            <form id="contest-form">
+                <div class="form-row">
+                    <label>页码
+                        <input type="number" name="page" min="1" value="1">
+                    </label>
+                    <label class="inline-checkbox">
+                        <input type="checkbox" name="onlyMine">
+                        只看我的比赛
+                    </label>
+                    <button type="submit">获取比赛</button>
+                </div>
+            </form>
+            <div class="status" id="contest-status"></div>
+            <div class="table-container">
+                <table id="contest-table">
+                    <thead>
+                        <tr>
+                            <th>编号</th>
+                            <th>比赛信息</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td colspan="3" class="placeholder">登录后可加载比赛列表</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pagination hidden" id="contest-pagination"></div>
+        </section>
+        <section class="card" id="contest-detail">
+            <h2>比赛详情</h2>
+            <div id="contest-detail-output" class="contest-detail-output">
+                <div class="placeholder">在比赛列表中选择一场比赛查看题目</div>
+            </div>
+        </section>
         <section class="card" id="problem-detail">
             <div class="problem-toolbar hidden" id="problem-toolbar">
                 <button type="button" id="toolbar-open-file">打开代码文件</button>
+            </div>
+            <div class="quick-actions hidden" id="problem-quick-actions">
+                <button type="button" id="quick-test-button">快速测试</button>
+                <button type="button" id="quick-submit-button">快速提交</button>
             </div>
             <div id="problem-output" class="problem-content">
                 <div class="placeholder">在题目列表中选择一题查看详情</div>
@@ -1252,8 +1413,96 @@ class OJAssistantProvider implements vscode.WebviewViewProvider {
         return payload;
     }
 
-    private cacheProblem(problemId: number, payload: ProblemPayload | undefined): void {
-        this.problemCache.set(problemId, { problemId, data: payload, fetchedAt: Date.now() });
+    private cacheProblem(
+        problemId: number,
+        payload: ProblemPayload | undefined,
+        contestContext?: ContestProblemContext,
+    ): void {
+        this.problemCache.set(problemId, {
+            problemId,
+            data: payload,
+            fetchedAt: Date.now(),
+            contestContext,
+        });
+    }
+
+    private toOptionalNumber(value: unknown): number | undefined {
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return value;
+        }
+        if (typeof value === 'string') {
+            const numeric = Number(value);
+            return Number.isFinite(numeric) ? numeric : undefined;
+        }
+        return undefined;
+    }
+
+    private toOptionalString(value: unknown): string | undefined {
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            return trimmed ? trimmed : undefined;
+        }
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return String(value);
+        }
+        return undefined;
+    }
+
+    private normalizeContestContext(
+        input?: { contestId?: unknown; contestPid?: unknown; contestProblemId?: unknown },
+    ): ContestProblemContext | undefined {
+        if (!input) {
+            return undefined;
+        }
+        const contestId = this.toOptionalString(input.contestId);
+        const contestPid = this.toOptionalNumber(input.contestPid);
+        const contestProblemId = this.toOptionalNumber(input.contestProblemId);
+        if (!contestId && contestPid === undefined && contestProblemId === undefined) {
+            return undefined;
+        }
+        return { contestId, contestPid, contestProblemId };
+    }
+
+    private deriveContestContextFromProblem(
+        problem: ProblemPayload | undefined,
+        base?: ContestProblemContext,
+    ): ContestProblemContext | undefined {
+        if (!problem && !base) {
+            return undefined;
+        }
+        const contestContext = this.normalizeContestContext({
+            contestId: problem?.contest_id ?? base?.contestId,
+            contestPid: problem?.contest_pid ?? base?.contestPid,
+            contestProblemId: problem?.contest_problem_id ?? problem?.problem_id ?? base?.contestProblemId,
+        });
+        return contestContext;
+    }
+
+    private extractProblemIdFromPayload(payload: ProblemPayload | undefined): number | undefined {
+        if (!payload) {
+            return undefined;
+        }
+        return this.toOptionalNumber(payload.problem_id);
+    }
+
+    private async persistFetchedProblem(problemId: number | null, problemData: unknown): Promise<void> {
+        await this.mutatePersistedSession((persisted) => {
+            if (typeof problemId === 'number' && Number.isFinite(problemId)) {
+                persisted.currentProblemId = problemId;
+                if (problemData !== undefined) {
+                    persisted.lastProblem = {
+                        problemId,
+                        data: problemData,
+                        fetchedAt: Date.now(),
+                    };
+                } else {
+                    delete persisted.lastProblem;
+                }
+            } else {
+                delete persisted.currentProblemId;
+                delete persisted.lastProblem;
+            }
+        });
     }
 
     private asProblemPayload(value: unknown): ProblemPayload | undefined {
